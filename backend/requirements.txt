@@ -5,17 +5,28 @@ python-dotenv>=1.0.0
 # Ingestion pipeline
 unstructured[pdf,docx,pptx]>=0.10.0
 openpyxl>=3.1.0
-tabulate>=0.9.0    # pandas .to_markdown() dependency
+tabulate>=0.9.0          # pandas .to_markdown() dependency
+tiktoken>=0.7.0          # token counting (matches text-embedding-3-small encoding)
+langchain-text-splitters>=0.2.0  # RecursiveCharacterTextSplitter for child chunks
 # openai            # added with embed_index.py
 # pinecone-client   # added with embed_index.py
 
-# Agent layer
-# langchain
-# langgraph
+# Embedding + vector DB
+openai>=1.0.0
+pinecone>=3.0.0
+rank-bm25>=0.2.2
+cohere>=5.0.0
+
+# Agent layer (langgraph>=0.5.4 fixes ABC+Generic MRO on Python 3.13)
+langchain>=0.3.26,<1.0.0
+langchain-core>=0.3.86,<1.0.0
+langgraph>=0.5.4
+langchain-openai>=0.3.35,<1.0.0
 
 # API
 # fastapi
 # uvicorn[standard]
 
 # Eval
-# ragas
+ragas>=0.4.3
+neo4j

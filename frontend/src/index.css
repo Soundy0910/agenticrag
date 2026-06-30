@@ -1,0 +1,154 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body, #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+  }
+
+  body {
+    @apply bg-surface-900 text-slate-100 font-sans;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    letter-spacing: -0.011em;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-slate-700 rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-slate-600;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-brand-500 hover:bg-brand-600 text-white font-medium text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center gap-2 px-3 py-1.5 rounded-lg hover:bg-white/5 text-slate-400 hover:text-slate-200 text-sm transition-colors;
+  }
+  .badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium;
+  }
+  .card {
+    @apply bg-surface-850 border border-white/5 rounded-xl;
+  }
+  .input {
+    @apply w-full bg-surface-800 border border-white/10 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-brand-500 focus:border-brand-500 transition-colors;
+  }
+}
+
+/* Typing cursor blink */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.cursor-blink::after {
+  content: '▋';
+  @apply text-brand-400;
+  animation: blink 1s step-end infinite;
+}
+
+/* Smooth message appearance */
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.message-enter {
+  animation: slideUp 0.2s ease-out;
+}
+
+/* Expanded detail fade-in */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.animate-fade-in {
+  animation: fadeIn 0.2s ease-out both;
+}
+
+/* ── Live Trace animations ─────────────────────────────── */
+
+/* Node card entrance: rises + scales in with a subtle bounce */
+@keyframes nodeAppear {
+  0%   { opacity: 0; transform: translateY(10px) scale(0.96); }
+  60%  { transform: translateY(-2px) scale(1.01); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+.node-appear {
+  animation: nodeAppear 0.35s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+/* Glow ring: pulsing outer ring on the active node icon */
+@keyframes glowRing {
+  0%, 100% { box-shadow: 0 0 0 0 var(--glow, rgba(139,92,246,0.4)); }
+  50%       { box-shadow: 0 0 0 5px var(--glow, rgba(139,92,246,0)); }
+}
+.glow-ring {
+  animation: glowRing 1.4s ease-in-out infinite;
+}
+
+/* Connector dot: a particle that travels down the vertical line once */
+@keyframes flowDot {
+  0%   { top: 0%;   opacity: 0; }
+  10%  { opacity: 1; }
+  90%  { opacity: 1; }
+  100% { top: 100%; opacity: 0; }
+}
+.flow-dot {
+  animation: flowDot 0.6s ease-in-out both;
+}
+
+/* Connector line fill: the vertical bar grows from 0 → full height */
+@keyframes lineFill {
+  from { height: 0; }
+  to   { height: 100%; }
+}
+.line-fill {
+  animation: lineFill 0.4s ease-out both;
+}
+
+/* Route badge pop in */
+@keyframes badgePop {
+  0%   { transform: scale(0.5); opacity: 0; }
+  70%  { transform: scale(1.08); }
+  100% { transform: scale(1);   opacity: 1; }
+}
+.badge-pop {
+  animation: badgePop 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+/* Shimmer for skeleton loading state */
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.04) 50%, transparent 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.6s ease-in-out infinite;
+}
+
+/* Pipeline step circle — filled animation */
+@keyframes stepComplete {
+  0%   { transform: scale(1.3); }
+  100% { transform: scale(1); }
+}
+.step-complete {
+  animation: stepComplete 0.25s ease-out both;
+}

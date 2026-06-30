@@ -28,3 +28,8 @@ outputs/
 # IDE
 .idea/
 .vscode/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/

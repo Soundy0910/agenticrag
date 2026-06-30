@@ -140,6 +140,20 @@ Live, streaming, node-level execution trace — shows **input → transformation
 - **OKF (Google Open Knowledge Format, v0.1, June 2026):** markdown+YAML curated-concept format for the *curated-knowledge* layer (complements raw-doc RAG, doesn't replace it). Conceptually close to the GraphRAG concept layer. **Post-MVP optional:** express curated financial concept definitions as a small OKF bundle the agent reads as authoritative definitions. Strong "I'm current" interview point. Not core (v0.1, unstable).
 - **Document updates/deletes:** metadata has `doc_id` to support update/delete of stale chunks.
 - **Cost/latency observability, prompt-injection-via-documents awareness, streaming token output, multi-user auth:** designed-for or named, not core-built.
+- **Compliance-crawler extension:** see §8.1 below.
+
+### 8.1 Compliance-crawler extension (designed, not built)
+
+**Idea:** an automated source-connector that crawls public regulatory sources (SEC EDGAR full-text search, EUR-Lex, UK FCA register, FINRA rulebooks) on a configurable schedule and feeds new filings directly into the existing ingest pipeline without human upload.
+
+**How it fits the current architecture:**
+1. A lightweight `backend/connectors/compliance_crawler.py` task (Celery beat or Azure Functions timer) polls each source via its public API or HTML scraper.
+2. Each discovered document is normalised to the same `{filename, bytes, collection, access_scope}` shape that `POST /api/documents/upload` already accepts — the crawler is just another producer of that interface.
+3. The crawler writes a `source_url`, `regulation_id`, and `effective_date` into the chunk metadata at ingest time; the router and grade node can surface these as citation context ("Source: SEC 10-K filing 2024-02-14").
+4. `access_scope` stays the existing mechanism — regulatory docs default to `"public"`; internal legal opinions can be scoped to `"legal-team"`.
+5. No changes to the agent graph, retrieval, or UI are needed — the `legal` collection simply fills with real documents instead of remaining a stub.
+
+**Why deferred:** crawler scheduling, dedup (same filing re-published with minor edits), and rate-limit / robots.txt compliance are operational concerns that add no new architectural insight for the demo. The ingest pipeline is already built to receive them; this is wiring, not design.
 
 ---
 
