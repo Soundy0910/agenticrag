@@ -141,3 +141,76 @@ agentic-rag/
 - [ ] RAGAS numbers (faithfulness etc.) in README
 - [ ] Deployed, shareable URL
 - [ ] You can explain every component and every "why this not the cheaper alt" in an interview
+
+---
+
+## Progress Log (last updated: 2026-06-30)
+
+> **For a fresh session with no memory of prior work:** read this section first. It tells you exactly what is done, what gaps exist, and where to start next.
+
+### Files built and status
+
+| # | File / Module | Status | Notes |
+|---|---|---|---|
+| 1 | `storage/base.py` | ✅ done | DocumentMetadata dataclass + DocumentSource abstract interface |
+| 2 | `storage/local.py` | ✅ done | Local folder connector |
+| 3 | `storage/azure_blob.py` | ✅ done | Real Azure Blob connector (personal account) |
+| 4 | `ingest/parse.py` | ✅ done | Multi-format parser (unstructured) |
+| 5 | `ingest/chunk.py` | ✅ done | Semantic + parent-document chunking; child ~300 tok, parent ~1800 tok |
+| 6 | `config.py` + `ingest/embed_index.py` | ✅ done | text-embedding-3-small, Pinecone upsert with metadata; COLLECTION_REGISTRY added |
+| 7 | `retrieval/hybrid.py` | ✅ done | Vector + BM25 hybrid search; BM25 None-sentinel fix for empty namespaces |
+| 8 | `retrieval/rerank.py` | ✅ done | Cohere rerank |
+| 9 | `agent/state.py` | ✅ done | LangGraph AgentState; active_collections field added |
+| 10 | `agent/nodes.py` | ✅ done | All nodes: rewrite, router (_classify_collections + collection='auto'), retrieve_vector (parallel multi-collection), retrieve_cag, retrieve_graph, grade, generate |
+| 11 | `agent/graph.py` | ✅ done | StateGraph compiled; active_collections in initial state |
+| 12 | `graph_rag/` | ✅ done | Finance entity schema, extraction, Neo4j query |
+| 13 | `api/query.py` | ✅ done | POST /query SSE stream; 'done' event includes contexts[:500] for inline eval |
+| 13b | `api/documents.py` + `api/ingest.py` | ✅ done | Upload/list/delete + ingest job endpoints |
+| 13c | `api/eval.py` | ✅ done | POST /api/eval — referenceless faithfulness + answer_relevancy; lazy RAGAS init; runs in thread pool |
+| 14 | `eval/testset.py` + `eval/run_ragas.py` | ✅ done | RAGAS 0.4.3 with old-style metric singletons + LangchainLLMWrapper/EmbeddingsWrapper |
+| 15 | `frontend/` | ✅ done | React 3-panel UI: DocumentLibrary, ChatPanel, LiveTrace, SourceCitations, UploadDropzone |
+
+**Extra work done (not in original plan):**
+- Cross-collection routing (`collection='auto'`, `_classify_collections`, `active_collections`, parallel hybrid search) — fully wired end-to-end
+- Frontend visual polish: `text-2xs`/`text-3xs` Tailwind tokens, `surface-825`, `letter-spacing: -0.011em`, `font-mono` on all data values in LiveTrace + SourceCitations
+- Inline RAGAS eval button per chat message (FlaskConical button → ScoreChip badges)
+- ARCHITECTURE.md §8.1 compliance-crawler extension documented
+
+### Known issues / quality gaps
+
+**CAG context_precision = 0.291 (low — expected but fixable)**
+CAG (`retrieve_cag_node`) fetches ALL chunks from the collection and stuffs them into context without filtering to the most relevant ones. RAGAS context_precision penalises this heavily because the top-ranked chunks are not ranked by relevance to the question — they're ordered by document structure. Fix: add a relevance-ranking step inside `retrieve_cag_node` (embed the query, cosine-rank the CAG chunks, pass only top-K to generate). This is not a correctness bug — the answer is still grounded — but it tanks the precision metric.
+
+**R03 routing test miss (expected)**
+R03 tests finance routing but the `finance` namespace was empty during eval. The agent fell back to `demo` collection. This is correct behaviour for an empty collection, not a bug. Will pass once finance documents are indexed.
+
+**Legal collection is a stub**
+`legal` collection has no indexed documents. The compliance-crawler extension (ARCHITECTURE.md §8.1) documents how to fill it.
+
+**Inline eval context quality**
+The `/api/eval` endpoint receives citation `source_text[:500]` as contexts. These are truncated to 500 chars. Faithfulness scoring works but longer contexts would be more accurate. The batch eval (`run_ragas.py`) uses full source text and is more reliable for regression testing.
+
+**langgraph 1.2.7 + Python 3.13 — package conflicts**
+`langchain` 0.3.26 and `langchain-community` 0.3.27 show pip resolver warnings (require langchain-core<0.4). Neither is directly imported in this codebase. Safe to ignore until LangChain publishes a 3.x-compatible release.
+
+### RAGAS baseline scores (2026-06 eval run, demo collection)
+| Metric | Score | Target |
+|---|---|---|
+| faithfulness | 0.800 | >0.85 |
+| answer_relevancy | 0.718 | >0.80 |
+| context_precision | 0.291 | >0.70 — see CAG gap above |
+| context_recall | 0.733 | >0.70 ✅ |
+
+### What the next session should start with
+
+**Priority 1 — CAG context_precision fix:**
+In `backend/agent/nodes.py`, `retrieve_cag_node()` fetches all chunk IDs and metadata, then passes them to `_chunks_to_context` unranked. Add an embedding-based relevance sort: embed `rewritten_query`, cosine-rank the CAG chunks, pass only the top 12 to the generate node. This should push context_precision from 0.291 → ~0.60+.
+
+**Priority 2 — Deploy:**
+Backend is containerisable (FastAPI + uvicorn). Frontend is Vite-built. Target: Railway or Render for backend, Vercel for frontend. Backend needs `PORT` env var and `CORS` origin set to the Vercel URL.
+
+**Priority 3 — Finance documents:**
+Index real SEC 10-K filings into the `finance` collection to make the cross-collection routing demo work end-to-end. The ingest pipeline is ready — just need documents.
+
+**Priority 4 — README with eval numbers and architecture diagram:**
+Add RAGAS scores table and a system diagram (can be ASCII or Mermaid) to README.md.
