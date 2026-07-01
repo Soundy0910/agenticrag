@@ -95,7 +95,7 @@ export async function getIngestStatus(jobId) {
  *   {event:'done',          answer, route, citations, ...}
  *   {event:'error',         detail}
  */
-export function streamQuery(question, collection, conversationHistory = [], onEvent) {
+export function streamQuery(question, collection, conversationHistory = [], onEvent, role = 'general') {
   const controller = new AbortController()
 
   ;(async () => {
@@ -104,7 +104,7 @@ export function streamQuery(question, collection, conversationHistory = [], onEv
       res = await fetch(`${BASE}/api/query`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, collection, conversation_history: conversationHistory }),
+        body: JSON.stringify({ question, collection, conversation_history: conversationHistory, role }),
         signal: controller.signal,
       })
     } catch (err) {

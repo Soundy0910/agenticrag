@@ -1,44 +1,45 @@
 """
 backend/agent/nodes.py
 
-LangGraph node functions — each takes the full AgentState and returns a dict
-of fields to update in the state. LangGraph merges the returned dict into the
-current state (additive fields via their reducers; others are replaced).
+LangGraph node functions — each takes AgentState and returns a state delta.
 
 Node execution order (wired in graph.py):
-  rewrite → router → retrieve (vector|cag|graph) → grade → [retry|generate]
+  rewrite → classify → router → access_check → retrieve → grade
+      → [validate_numbers] → generate → END
 
-Each node is a plain function — no classes, no side-effects outside state.
+New nodes vs original:
+  classify_node       — query type classification (factual/comparison/risk/etc.)
+  access_check_node   — RBAC: blocks queries to restricted collections
+  validate_numbers_node — deterministic numeric extraction + calculation
+
+All nodes record their latency in step_latencies for the Live Trace UI.
 """
 
+import json
 import logging
 import re
+import time
 from typing import Any
 
 from openai import OpenAI
 
 import backend.config as cfg
-from backend.agent.state import AgentState, Citation, ConversationTurn
+from backend.agent.state import AgentState, Citation, CollectionQuery, ConversationTurn
 from backend.retrieval.hybrid import ChunkResult, hybrid_search
 from backend.retrieval.rerank import rerank
 
 logger = logging.getLogger(__name__)
 
-# CAG: if estimated total tokens in the collection is below this threshold,
-# stuff all documents into context instead of retrieving.
-# Based on gpt-4o-mini's 128k context; leaving headroom for system prompt and answer.
 _CAG_TOKEN_THRESHOLD = 80_000
-
-# Grade/retry cap — prevent infinite loops when corpus lacks the answer.
+_FACET_TOP_K = 6
 _MAX_RETRIES = 2
 
-# Comparison question keywords (checked before deciding to decompose).
 _COMPARISON_PATTERNS = re.compile(
-    r"\b(compar|vs\.?|versus|differ|between|both|which is (better|higher|lower|more|less))\b",
+    r"\b(compar\w*|vs\.?|versus|differ\w*|between|both|which is (better|higher|lower|more|less))\b",
     re.IGNORECASE,
 )
 
-# ── OpenAI client singleton ──────────────────────────────────────────────────
+# ── OpenAI client ────────────────────────────────────────────────────────────
 
 _openai: OpenAI | None = None
 
@@ -50,51 +51,51 @@ def _llm() -> OpenAI:
     return _openai
 
 
-def _chat(messages: list[dict], max_tokens: int = 512, temperature: float = 0.0) -> str:
-    """Thin wrapper around OpenAI chat completions."""
+def _chat_with_usage(
+    messages: list[dict], max_tokens: int = 512, temperature: float = 0.0
+) -> tuple[str, int, int]:
+    """Chat completion returning (content, prompt_tokens, completion_tokens)."""
     resp = _llm().chat.completions.create(
         model=cfg.DEFAULT_LLM_MODEL,
         messages=messages,
         max_tokens=max_tokens,
         temperature=temperature,
     )
-    return resp.choices[0].message.content.strip()
+    content = resp.choices[0].message.content.strip()
+    usage = resp.usage
+    prompt_tok = usage.prompt_tokens if usage else 0
+    completion_tok = usage.completion_tokens if usage else 0
+    return content, prompt_tok, completion_tok
 
 
-# ── Helper: context string from chunks ──────────────────────────────────────
+def _chat(messages: list[dict], max_tokens: int = 512, temperature: float = 0.0) -> str:
+    content, _, _ = _chat_with_usage(messages, max_tokens, temperature)
+    return content
+
+
+def _tok(prompt: int, completion: int) -> dict:
+    """Return token accounting fields for state update."""
+    return {
+        "total_tokens": prompt + completion,
+        "input_tokens": prompt,
+        "output_tokens": completion,
+    }
+
+
+# ── Context helpers ──────────────────────────────────────────────────────────
 
 _PARENT_IDX_RE = re.compile(r"__p(\d+)")
 
 
 def _chunk_doc_order(chunk: "ChunkResult") -> int:
-    """
-    Extract the parent_index from a chunk_id so we can sort chunks in the
-    order they originally appeared in the document.
-
-    Chunk IDs follow the pattern  {doc_hash}__p{parent_idx}[__c{child_idx}].
-    Sorting by parent_idx restores document order, which is critical for
-    structured documents (resumes, reports) where section headers immediately
-    precede their content.  Random Pinecone fetch order breaks this.
-    """
     m = _PARENT_IDX_RE.search(chunk.chunk_id)
     return int(m.group(1)) if m else 0
 
 
-def _chunks_to_context(chunks: list[ChunkResult], max_chunks: int | None = None, group_by_doc: bool = False) -> str:
-    """Format chunks as a numbered context block for prompts.
-
-    max_chunks=None means use all chunks (correct for CAG, which already
-    verified the full collection fits in context). Vector/graph paths pass
-    an explicit cap so the prompt stays within a predictable size.
-
-    group_by_doc=True groups chunks under their source filename AND sorts
-    them by their original document order (parent_index encoded in chunk_id).
-    This keeps company headers adjacent to their bullet points, and ensures
-    the LLM reads each document from top to bottom — critical for CAG where
-    Pinecone returns chunks in random fetch order.
-    """
+def _chunks_to_context(
+    chunks: list[ChunkResult], max_chunks: int | None = None, group_by_doc: bool = False
+) -> str:
     items = chunks if max_chunks is None else chunks[:max_chunks]
-
     if group_by_doc:
         from collections import defaultdict
         groups: dict[str, list] = defaultdict(list)
@@ -103,14 +104,12 @@ def _chunks_to_context(chunks: list[ChunkResult], max_chunks: int | None = None,
         parts = []
         n = 1
         for filename, doc_chunks in groups.items():
-            # Restore document order within each file
             doc_chunks_sorted = sorted(doc_chunks, key=_chunk_doc_order)
             parts.append(f"── Document: {filename} ──")
             for c in doc_chunks_sorted:
                 parts.append(f"[{n}]\n{c.source_text}")
                 n += 1
         return "\n\n".join(parts)
-
     return "\n\n".join(
         f"[{i+1}] (from {c.filename})\n{c.source_text}"
         for i, c in enumerate(items)
@@ -121,310 +120,907 @@ def _is_comparison(query: str) -> bool:
     return bool(_COMPARISON_PATTERNS.search(query))
 
 
-def _classify_collections(query: str) -> list[str]:
-    """
-    Return the collection(s) most relevant to this query, best match first.
-
-    Two-stage approach:
-      1. Keyword fast-path: count hits from a per-collection keyword table.
-         If one collection scores ≥2× the next, return it alone.
-      2. LLM fallback: when keyword scores tie or all are zero, ask the LLM to
-         pick from the registry descriptions. Returns top-2 when still ambiguous
-         so the retrieve step can search both namespaces and merge via RRF.
-
-    Using 'auto' as the collection in QueryRequest triggers this function.
-    """
+def _indexed_collections() -> set[str]:
     from backend.config import COLLECTION_REGISTRY
+    try:
+        from backend.ingest.embed_index import _get_pinecone
+        import backend.config as _cfg
+        pc = _get_pinecone()
+        stats = pc.Index(_cfg.PINECONE_INDEX_NAME).describe_index_stats()
+        ns = stats.get("namespaces") or {}
+        indexed = set()
+        for name, info in ns.items():
+            vc = info.get("vector_count", 0) if isinstance(info, dict) else getattr(info, "vector_count", 0)
+            if vc > 0 and name in COLLECTION_REGISTRY:
+                indexed.add(name)
+        return indexed or set(COLLECTION_REGISTRY.keys())
+    except Exception as exc:
+        logger.warning("_indexed_collections: %s", exc)
+        return set(COLLECTION_REGISTRY.keys())
 
+
+def _classify_collections(query: str) -> list[str]:
+    """Return the collection(s) most relevant to this query, best match first."""
+    from backend.config import COLLECTION_REGISTRY
     registry = COLLECTION_REGISTRY
+    indexed = _indexed_collections()
     if not registry:
-        return ["demo"]
+        return ["sec-filings"]
 
-    # Keyword table — add terms as new collections are introduced
     _KEYWORDS: dict[str, list[str]] = {
-        "finance": [
-            "revenue", "roi", "earnings", "fiscal", "financial", "profit", "loss",
-            "stock", "sec", "filing", "balance sheet", "cash flow", "ebitda",
-            "quarter", "annual report", "dividend", "market cap",
+        "sec-filings": [
+            "10-k", "annual report", "revenue", "net income", "fiscal year",
+            "earnings", "operating income", "eps", "diluted", "shares outstanding",
+            "risk factors", "management discussion", "md&a", "audited financials",
+            "aapl", "msft", "nvda", "googl", "amzn", "tsla", "meta",
+            "jpm", "jnj", "wmt", "xom", "pfe", "dis", "ko", "v",
+            "apple", "microsoft", "nvidia", "google", "amazon", "tesla",
+            "jpmorgan", "johnson", "walmart", "exxon", "pfizer", "disney",
+            "coca-cola", "visa", "gross margin", "r&d spending", "net sales",
         ],
-        "legal": [
-            "legal", "lawsuit", "dispute", "litigation", "contract", "compliance",
-            "regulation", "court", "settlement", "attorney", "plaintiff", "defendant",
-            "jurisdiction", "statute", "tort", "breach",
-        ],
-        "demo": [
-            "resume", "candidate", "skills", "certification", "experience",
-            "gpa", "degree", "project", "internship", "work history",
+        "legal-docs": [
+            "contract", "agreement", "clause", "indemnification", "liability",
+            "exhibit", "credit facility", "license agreement", "supply agreement",
+            "employment agreement", "nda", "non-disclosure", "merger agreement",
+            "material agreement", "governing law", "termination", "intellectual property",
+            "warranty", "arbitration", "representations", "covenants",
+            "clawback", "recoupment", "recoup", "compensation agreement",
+            "award agreement", "equity award", "incentive plan", "executive compensation",
+            "restricted stock", "rsu", "severance", "deferred compensation",
         ],
     }
 
+    _COMPANY_KWS = [
+        "aapl", "msft", "nvda", "googl", "amzn", "tsla", "meta", "jpm", "jnj",
+        "apple", "microsoft", "nvidia", "google", "amazon", "tesla", "jpmorgan",
+        "johnson", "walmart", "exxon", "pfizer", "disney",
+    ]
+    _FIN_KWS = [
+        "revenue", "net income", "fiscal year", "earnings", "annual report",
+        "10-k", "operating income", "profit", "roi", "ebitda",
+    ]
+    _LEGAL_KWS = _KEYWORDS["legal-docs"]
+
     q_lower = query.lower()
-    scores: dict[str, int] = {name: 0 for name in registry}
+
+    def _count_hits(kws: list[str]) -> int:
+        return sum(1 for kw in kws if kw in q_lower)
+
+    has_company = _count_hits(_COMPANY_KWS) > 0
+    has_financial = _count_hits(_FIN_KWS) > 0
+    has_legal = _count_hits(_LEGAL_KWS) > 0
+
+    cross_domain = (
+        has_company and has_legal and (
+            has_financial or "annual report" in q_lower or "10-k" in q_lower
+        )
+    )
+    if cross_domain and "sec-filings" in indexed and "legal-docs" in indexed:
+        logger.info("classify_collections: cross-domain")
+        return ["sec-filings", "legal-docs"]
+
+    scores: dict[str, int] = {name: 0 for name in registry if name in indexed}
     for collection, kws in _KEYWORDS.items():
-        if collection in registry:
+        if collection in scores:
             for kw in kws:
                 if kw in q_lower:
                     scores[collection] += 1
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    if not ranked:
+        return ["sec-filings"] if "sec-filings" in indexed else [next(iter(indexed))]
+
     top_score = ranked[0][1]
     second_score = ranked[1][1] if len(ranked) > 1 else 0
 
-    # Clear keyword winner
     if top_score > 0 and top_score >= 2 * max(second_score, 1):
-        logger.info("classify_collections: keyword winner=%r (score=%d)", ranked[0][0], top_score)
         return [ranked[0][0]]
 
-    # Ambiguous or no keyword hits — ask the LLM
-    descriptions = "\n".join(f"  {name}: {desc}" for name, desc in registry.items())
+    descriptions = "\n".join(
+        f"  {name}: {desc}" for name, desc in registry.items() if name in indexed
+    )
     prompt = (
         f"You are a document router. Given the query below, decide which 1 or 2 "
         f"document collections are most relevant. Return ONLY the collection name(s), "
-        f"comma-separated, from this list:\n{descriptions}\n\n"
-        f"Query: {query}\n\n"
-        f"Answer (collection name(s) only):"
+        f"comma-separated, from this list:\n{descriptions}\n\nQuery: {query}\n\nAnswer:"
     )
-    raw = _chat(
-        [{"role": "user", "content": prompt}],
-        max_tokens=30,
-    ).strip().lower()
-
-    chosen = [c.strip() for c in raw.split(",") if c.strip() in registry]
+    raw = _chat([{"role": "user", "content": prompt}], max_tokens=30).strip().lower()
+    chosen = [c.strip() for c in raw.split(",") if c.strip() in registry and c.strip() in indexed]
     if not chosen:
-        # LLM returned something unexpected — fall back to keyword winner or demo
-        chosen = [ranked[0][0]] if top_score > 0 else ["demo"]
-
-    logger.info("classify_collections: llm chose=%r for query=%r", chosen, query[:60])
-    return chosen[:2]  # cap at 2
+        if top_score > 0:
+            winner = ranked[0][0]
+        elif has_financial and "sec-filings" in indexed:
+            winner = "sec-filings"
+        elif has_legal and "legal-docs" in indexed:
+            winner = "legal-docs"
+        else:
+            winner = "sec-filings" if "sec-filings" in indexed else next(iter(indexed))
+        chosen = [winner]
+    return chosen[:2]
 
 
 def _has_named_entity(query: str) -> bool:
-    """
-    Return True if the query references a specific named entity mid-sentence
-    (e.g. "AmplifAI", "Pinnacle Weaving Mills", "AWS").
-
-    WHY THIS MATTERS FOR ROUTING:
-      CAG (context-stuffing) dumps the entire collection into context. This is
-      correct for aggregate/broad questions ("list all work experiences") where
-      the LLM needs all content to build a comprehensive answer.
-
-      For entity-specific questions ("explain AmplifAI experience", "what did he
-      do at Pinnacle"), CAG can cause misattribution: the LLM sees 30+ chunks and
-      conflates adjacent resume sections (Work Experience + Projects) because they
-      happen to sit near each other in the document.
-
-      Vector + BM25 is strictly better for entity queries: BM25 finds chunks that
-      explicitly mention the entity name, so retrieved chunks are already scoped
-      to that company/project — no cross-section confusion possible.
-
-    HEURISTIC:
-      A word appearing mid-sentence (not the first word) that starts with a capital
-      letter and is longer than 2 characters is very likely a proper noun (company,
-      person, product, certification). This catches "AmplifAI", "Pinnacle", "AWS",
-      "Neo4j", "LangGraph" etc. while not triggering on sentence-start words.
-    """
     words = query.split()
-    for word in words[1:]:          # skip the first word (always capitalised)
+    for word in words[1:]:
         clean = word.strip('.,?!;:()')
         if clean and clean[0].isupper() and len(clean) > 2:
             return True
     return False
 
 
-# ── Node 1: rewrite ──────────────────────────────────────────────────────────
+_RELATIVE_YEAR_RE = re.compile(
+    r"\b(?:the\s+)?(?:previous|prior|preceding)\s+year\b|"
+    r"\bthe\s+year\s+before(?:\s+that)?\b|"
+    r"\blast\s+year\b",
+    re.IGNORECASE,
+)
+
+
+def _anchor_year_from_history(history: list[ConversationTurn]) -> int | None:
+    years: list[int] = []
+    for turn in history[-3:]:
+        src = turn.rewritten_query or turn.question
+        for match in re.finditer(r"\b(20\d{2}|19\d{2})\b", src):
+            years.append(int(match.group(1)))
+    return years[-1] if years else None
+
+
+def _apply_relative_year_resolution(text: str, anchor_year: int | None) -> str:
+    if anchor_year is None:
+        return text
+    target = str(anchor_year - 1)
+    return _RELATIVE_YEAR_RE.sub(lambda _: target, text)
+
+
+# ── Citation helpers ─────────────────────────────────────────────────────────
+
+# Company name → (ticker, display name) for citation enrichment
+_COMPANY_NAME_MAP: dict[str, tuple[str, str]] = {
+    "microsoft": ("MSFT", "Microsoft"),
+    "msft": ("MSFT", "Microsoft"),
+    "apple": ("AAPL", "Apple"),
+    "aapl": ("AAPL", "Apple"),
+    "nvidia": ("NVDA", "NVIDIA"),
+    "nvda": ("NVDA", "NVIDIA"),
+    "alphabet": ("GOOGL", "Alphabet/Google"),
+    "google": ("GOOGL", "Alphabet/Google"),
+    "googl": ("GOOGL", "Alphabet/Google"),
+    "amazon": ("AMZN", "Amazon"),
+    "amzn": ("AMZN", "Amazon"),
+    "meta": ("META", "Meta"),
+    "tesla": ("TSLA", "Tesla"),
+    "tsla": ("TSLA", "Tesla"),
+    "jpmorgan": ("JPM", "JPMorgan Chase"),
+    "jpm": ("JPM", "JPMorgan Chase"),
+    "walmart": ("WMT", "Walmart"),
+    "wmt": ("WMT", "Walmart"),
+    "johnson": ("JNJ", "Johnson & Johnson"),
+    "jnj": ("JNJ", "J&J"),
+    "pfizer": ("PFE", "Pfizer"),
+    "pfe": ("PFE", "Pfizer"),
+    "exxon": ("XOM", "ExxonMobil"),
+    "xom": ("XOM", "ExxonMobil"),
+    "disney": ("DIS", "Disney"),
+    "dis": ("DIS", "Disney"),
+    "coca-cola": ("KO", "Coca-Cola"),
+    "ko": ("KO", "Coca-Cola"),
+    "visa": ("V", "Visa"),
+}
+
+
+def _detect_company_display(filename: str, doc_id: str) -> str:
+    """Return human-readable company name from filename/doc_id."""
+    combined = (filename + " " + doc_id).lower()
+    for key, (_, display) in _COMPANY_NAME_MAP.items():
+        if key in combined:
+            return display
+    return ""
+
+
+def _detect_filing_type(filename: str) -> str:
+    """Return filing type from filename."""
+    fn = filename.lower()
+    if "10k" in fn or "10-k" in fn:
+        # Check for exhibit markers
+        m = re.search(r"exhibit(\d+)", fn)
+        if m:
+            return f"EX-{m.group(1)}"
+        return "10-K"
+    if "ex10" in fn or "exhibit10" in fn or "ex-10" in fn:
+        m = re.search(r"ex(?:hibit)?[\s_-]?10[_.]?(\d+)", fn)
+        if m:
+            return f"EX-10.{m.group(1)}"
+        return "EX-10"
+    if "exhibit" in fn:
+        m = re.search(r"exhibit(\d+)", fn)
+        if m:
+            return f"EX-{m.group(1)}"
+    return "Filing"
+
+
+def _detect_fiscal_year(filename: str) -> str:
+    """Extract fiscal year label from filename date (e.g. 10k_2025-07-30.htm → FY2025)."""
+    m = re.search(r"(\d{4})-\d{2}-\d{2}", filename)
+    if m:
+        return f"FY{m.group(1)}"
+    m = re.search(r"(\d{4})", filename)
+    if m:
+        return f"FY{m.group(1)}"
+    return ""
+
+
+def _build_citation(chunk: ChunkResult) -> Citation:
+    """Build an enriched Citation from a retrieved chunk."""
+    company = _detect_company_display(chunk.filename, chunk.doc_id)
+    filing_type = _detect_filing_type(chunk.filename)
+    fiscal_year = _detect_fiscal_year(chunk.filename)
+
+    # Build human-readable display name
+    parts = []
+    if company:
+        parts.append(company)
+    if fiscal_year and filing_type == "10-K":
+        parts.append(fiscal_year)
+    if filing_type:
+        parts.append(f"Form {filing_type}")
+    display_name = " ".join(parts) if parts else chunk.filename
+
+    return Citation(
+        chunk_id=chunk.chunk_id,
+        doc_id=chunk.doc_id,
+        filename=chunk.filename,
+        collection=chunk.collection,
+        source_text=chunk.source_text,
+        company=company,
+        filing_type=filing_type,
+        fiscal_year=fiscal_year,
+        display_name=display_name,
+    )
+
+
+# ── Company markers for facet retrieval ─────────────────────────────────────
+
+_COMPANY_MARKERS: dict[str, list[str]] = {
+    "microsoft": ["microsoft", "msft", "2025-07-30"],
+    "apple": ["apple", "aapl", "2025-10-31"],
+    "nvidia": ["nvidia", "nvda", "2026-02-25"],
+    "amazon": ["amazon", "amzn", "2026-02-06"],
+    "google": ["google", "alphabet", "googl", "2026-02-05"],
+    "meta": ["meta platforms", "meta", "fb", "2026-01-29"],
+    "tesla": ["tesla", "tsla"],
+    "jpmorgan": ["jpmorgan", "jpm", "jpmorgan chase", "2026-02-13"],
+    "walmart": ["walmart", "wmt", "2026-03-13"],
+    "johnson": ["johnson", "jnj", "2026-02-11"],
+    "pfizer": ["pfizer", "pfe", "2026-02-26"],
+    "exxon": ["exxon", "xom", "2026-02-18"],
+    "disney": ["disney", "dis", "2026-03-16"],
+    "coca-cola": ["coca-cola", "coca cola", "ko", "2026-02-20"],
+    "visa": ["visa", "2025-11-06"],
+}
+
+
+def _company_markers_for_query(sub_question: str) -> list[str]:
+    q_lower = sub_question.lower()
+    for key, markers in _COMPANY_MARKERS.items():
+        if key in q_lower:
+            return markers
+    return []
+
+
+def _filter_by_company(sub_question: str, candidates: list[ChunkResult]) -> list[ChunkResult]:
+    markers = _company_markers_for_query(sub_question)
+    if not markers:
+        return candidates
+    matched = [
+        c for c in candidates
+        if any(m in c.filename.lower() or m in c.doc_id.lower() or m in c.source_text[:400].lower() for m in markers)
+    ]
+    if matched:
+        rest = [c for c in candidates if c not in matched]
+        return matched + rest
+    return candidates
+
+
+def _boost_facet_candidates(
+    sub_question: str, collection: str, candidates: list[ChunkResult],
+) -> list[ChunkResult]:
+    q_lower = sub_question.lower()
+    signals: list[str] = []
+    if collection == "sec-filings":
+        if any(w in q_lower for w in ("revenue", "sales", "income", "fiscal", "profit", "earnings")):
+            signals = [
+                "summary results of operations",
+                "consolidated statements of operations",
+                "consolidated net sales", "net revenues", "revenue $",
+                "net sales", "total revenue", "total net sales",
+            ]
+        if any(w in q_lower for w in ("risk factor", "risk factors", "risks")):
+            risk_signals = [
+                "item 1a", "risk factor", "risk factors", "our business is subject",
+                "competition", "cybersecurity", "cyber", "supply chain", "regulatory",
+                "macroeconomic", "labor", "data privacy", "climate", "liquidity",
+                "material adverse", "could materially",
+            ]
+            signals = risk_signals + signals
+    elif collection == "legal-docs":
+        if any(w in q_lower for w in ("clawback", "recoupment", "recoup")):
+            signals = ["clawback", "recoupment", "recoup", "erroneously awarded", "recovery of"]
+        if any(w in q_lower for w in ("terminat", "expiration", "default")):
+            signals = ["termination", "terminat", "event of default", "duration, termination"] + signals
+        if any(w in q_lower for w in ("indemnif", "liability")):
+            signals = ["indemnif", "liability"] + signals
+    if not signals:
+        return candidates
+    boosted = [c for c in candidates if any(s in c.source_text.lower() for s in signals)]
+    rest = [c for c in candidates if c not in boosted]
+    if boosted:
+        logger.info("facet boost %r: promoted %d/%d", collection, len(boosted), len(candidates))
+    return boosted + rest
+
+
+def _ensure_signal_in_top(
+    ranked: list[ChunkResult], pool: list[ChunkResult],
+    signals: list[str], top_n: int, company_markers: list[str] | None = None,
+) -> list[ChunkResult]:
+    if any(any(s in c.source_text.lower() for s in signals) for c in ranked):
+        return ranked
+    for sig in signals:
+        for c in pool:
+            if sig in c.source_text.lower() and c not in ranked:
+                if company_markers and not any(
+                    m in c.filename.lower() or m in c.doc_id.lower() or m in c.source_text[:400].lower()
+                    for m in company_markers
+                ):
+                    continue
+                ranked = [c] + ranked[:top_n - 1]
+                return ranked
+    return ranked
+
+
+def _infer_section_filter(query: str, collection: str) -> str | None:
+    """
+    Map query intent to a section_type filter for section-aware retrieval.
+
+    Returns None for broad queries or when no single section type dominates.
+    The filter is passed to hybrid_search which applies it at both the
+    Pinecone metadata level (vector search) and corpus level (BM25).
+    """
+    q = query.lower()
+
+    if "legal" in collection.lower():
+        return None  # legal-docs are all legal_provision, filter adds no value
+
+    if any(w in q for w in (
+        "revenue", "net sales", "net income", "earnings", "total income",
+        "operating income", "fiscal year", "profit", "gross margin",
+        "income statement", "eps", "diluted", "consolidated net",
+    )):
+        return "income_statement"
+
+    if any(w in q for w in (
+        "risk factor", "risk factors", "identified risk", "key risk",
+        "main risk", "what risk", "cybersecurity risk", "supply chain risk",
+    )):
+        return "risk_factors"
+
+    if any(w in q for w in (
+        "management discussion", "management's discussion", "md&a",
+        "business outlook", "results of operations",
+    )):
+        return "mda"
+
+    # Comparison with revenue signal → income_statement
+    if _is_comparison(query) and any(w in q for w in ("revenue", "sales", "income")):
+        return "income_statement"
+
+    return None
+
+
+def _retrieve_for_facet(
+    sub_question: str, collection: str, scopes: list[str], top_n: int = _FACET_TOP_K,
+    section_filter: str | None = None,
+) -> list[ChunkResult]:
+    if section_filter is None:
+        section_filter = _infer_section_filter(sub_question, collection)
+    candidates = hybrid_search(sub_question, collection, scopes, top_k=40, section_filter=section_filter)
+    # Fallback: if section filter yields nothing (vectors not yet backfilled), retry without
+    if not candidates and section_filter:
+        logger.info("_retrieve_for_facet: section_filter=%r empty, retrying unfiltered", section_filter)
+        candidates = hybrid_search(sub_question, collection, scopes, top_k=40)
+    markers = _company_markers_for_query(sub_question)
+    if markers:
+        def _matches(c: ChunkResult, ms: list[str]) -> bool:
+            fl = c.filename.lower(); dl = c.doc_id.lower(); tl = c.source_text[:400].lower()
+            return any(m in fl or m in dl or m in tl for m in ms)
+        scoped = [c for c in candidates if _matches(c, markers)]
+        if not scoped:
+            company_key = markers[0]
+            extra = hybrid_search(f"{company_key} {sub_question}", collection, scopes, top_k=50)
+            scoped = [c for c in extra if _matches(c, markers)]
+        search_pool = scoped if scoped else candidates
+    else:
+        search_pool = candidates
+
+    search_pool = _boost_facet_candidates(sub_question, collection, search_pool)
+    ranked = rerank(sub_question, search_pool, top_n=top_n)
+    q_lower = sub_question.lower()
+
+    if collection == "legal-docs" and any(w in q_lower for w in ("terminat", "expiration", "default")):
+        ranked = _ensure_signal_in_top(ranked, search_pool, ["terminat", "termination"], top_n, markers or None)
+    if collection == "legal-docs" and any(w in q_lower for w in ("clawback", "recoupment", "recoup")):
+        ranked = _ensure_signal_in_top(ranked, search_pool, ["clawback", "recoupment", "recoup"], top_n, markers or None)
+    if collection == "sec-filings" and any(w in q_lower for w in ("risk factor", "risk factors", "risks")):
+        ranked = _ensure_signal_in_top(
+            ranked, search_pool,
+            ["risk factor", "item 1a", "competition", "cybersecurity", "supply chain", "regulatory", "macroeconomic"],
+            top_n, markers or None,
+        )
+    if collection == "sec-filings" and any(w in q_lower for w in ("revenue", "sales", "income")):
+        ranked = _ensure_signal_in_top(
+            ranked, search_pool, ["summary results of operations"], top_n, markers or None,
+        )
+        _fin_signals = (
+            "summary results of operations", "consolidated net sales",
+            "consolidated statements of operations", "net revenues", "total net sales", "revenue $",
+        )
+        has_total_revenue = any(any(sig in c.source_text.lower() for sig in _fin_signals) for c in ranked)
+        if not has_total_revenue and markers:
+            company = next((k for k in _COMPANY_MARKERS if k in q_lower), "company")
+            fallback_q = (
+                f"{company} SUMMARY RESULTS OF OPERATIONS consolidated net sales "
+                f"total revenue net sales millions income statement fiscal year"
+            )
+            fb_candidates = hybrid_search(fallback_q, collection, scopes, top_k=50)
+            fb_pool = [
+                c for c in fb_candidates
+                if any(m in c.filename.lower() or m in c.doc_id.lower() or m in c.source_text[:400].lower() for m in markers)
+            ]
+            fb_pool = _boost_facet_candidates(fallback_q, collection, fb_pool)
+            fb_ranked = rerank(fallback_q, fb_pool, top_n=8)
+            seen = {c.chunk_id for c in ranked}
+            for c in fb_ranked:
+                if any(sig in c.source_text.lower() for sig in _fin_signals) and c.chunk_id not in seen:
+                    ranked = [c] + [x for x in ranked if x.chunk_id != c.chunk_id][:top_n - 1]
+                    break
+    return ranked
+
+
+def _collection_queries_from_state(state: AgentState) -> list[CollectionQuery]:
+    raw = state.get("collection_queries") or []
+    result: list[CollectionQuery] = []
+    for item in raw:
+        if isinstance(item, CollectionQuery):
+            result.append(item)
+        elif isinstance(item, dict) and item.get("collection"):
+            result.append(CollectionQuery(
+                collection=item["collection"],
+                sub_question=item.get("sub_question", ""),
+            ))
+    return result
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Node 1: rewrite
+# ════════════════════════════════════════════════════════════════════════════
 
 def rewrite_node(state: AgentState) -> dict[str, Any]:
-    """
-    Rewrite the user's question into a self-contained standalone query.
-
-    WHY:
-      Follow-up questions like "What about their revenue?" are ambiguous without
-      history. Converting them to "What was Company X's revenue in FY2023?"
-      makes retrieval precise — the embedding of a vague pronoun-heavy question
-      will drift in the embedding space and miss the right chunks.
-
-    HOW:
-      Shows the LLM the last 3 questions from conversation_history (not answers)
-      plus the current question. Instructs it to resolve pronouns and references
-      and return a fully standalone question. Cost: ~200 tokens per turn, flat.
-
-    Turn 1 shortcut:
-      No history → return question unchanged (no LLM call needed).
-    """
+    """Rewrite the question into a self-contained standalone query."""
+    t0 = time.time()
     question: str = state["question"]
     history: list[ConversationTurn] = state.get("conversation_history", [])
 
     if not history:
-        return {"rewritten_query": question}
+        return {
+            "rewritten_query": question,
+            "step_latencies": {"rewrite": round((time.time() - t0) * 1000)},
+            **_tok(0, 0),
+        }
 
-    recent_qs = "\n".join(f"- {t.question}" for t in history[-3:])
+    recent_turns = "\n".join(
+        f"- Q: {t.question}" + (f"\n  → resolved: {t.rewritten_query}" if t.rewritten_query else "")
+        for t in history[-3:]
+    )
+    anchor_year = _anchor_year_from_history(history)
+    resolved_question = _apply_relative_year_resolution(question, anchor_year)
+    year_hint = (
+        f"\nTemporal context: prior turn resolved to year {anchor_year}. "
+        f"'Previous year', 'last year' mean {anchor_year - 1}."
+        if anchor_year else ""
+    )
+
     prompt = (
         f"Rewrite the follow-up question as a fully standalone question.\n\n"
-        f"Recent questions:\n{recent_qs}\n\n"
-        f"Follow-up: {question}\n\n"
-        f"Standalone question (return only the rewritten question, no explanation):"
+        f"Prior conversation turns:\n{recent_turns}{year_hint}\n\n"
+        f"Follow-up: {resolved_question}\n\n"
+        f"Rules:\n"
+        f"1. Replace pronouns with explicit entity names from prior queries.\n"
+        f"2. Resolve relative time references to actual years.\n"
+        f"3. Return only the rewritten question."
     )
-    standalone = _chat(
+    standalone, pt, ct = _chat_with_usage(
         [
             {"role": "system", "content": "You rewrite follow-up questions into standalone questions."},
             {"role": "user", "content": prompt},
         ],
         max_tokens=150,
     )
+    standalone = _apply_relative_year_resolution(standalone, anchor_year)
     logger.info("rewrite: %r → %r", question, standalone)
-    return {"rewritten_query": standalone}
+    return {
+        "rewritten_query": standalone,
+        "step_latencies": {"rewrite": round((time.time() - t0) * 1000)},
+        **_tok(pt, ct),
+    }
 
 
-# ── Node 2: router ───────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# Node 1b: classify
+# ════════════════════════════════════════════════════════════════════════════
+
+# Valid query types for validation
+_VALID_QUERY_TYPES = {
+    "factual_lookup", "comparison", "trend_analysis", "calculation",
+    "risk_analysis", "multi_document_reasoning", "summarization",
+    "out_of_scope", "unclear",
+}
+
+_DEFAULT_CLASSIFICATION = {
+    "query_type": "factual_lookup",
+    "requires_calculation": False,
+    "requires_multi_doc": False,
+    "requires_graph": False,
+    "expected_output_format": "short_answer_with_citation",
+    "reason": "Default classification — LLM parse failed.",
+}
+
+
+def classify_node(state: AgentState) -> dict[str, Any]:
+    """
+    Classify the query into a structured type that downstream nodes use
+    to choose retrieval strategy, prompt template, and answer format.
+
+    Classification influences:
+      - factual_lookup    → brief answer with citation
+      - comparison        → table format, fresh per-entity retrieval
+      - trend_analysis    → temporal summary with direction and drivers
+      - calculation       → numeric extraction + deterministic calculation
+      - risk_analysis     → bullet summary with categories and evidence
+      - multi_document_reasoning → multi-facet retrieval
+      - out_of_scope      → polite refusal with scope explanation
+      - unclear           → clarification request
+    """
+    t0 = time.time()
+    query: str = state.get("rewritten_query") or state["question"]
+
+    prompt = f"""Classify this document query. Return valid JSON only — no markdown, no explanation.
+
+Query: {query}
+
+Return exactly this JSON structure:
+{{
+  "query_type": "<one of: factual_lookup | comparison | trend_analysis | calculation | risk_analysis | multi_document_reasoning | summarization | out_of_scope | unclear>",
+  "requires_calculation": <true|false>,
+  "requires_multi_doc": <true|false>,
+  "requires_graph": <true|false>,
+  "expected_output_format": "<one of: short_answer_with_citation | comparison_table | trend_summary | calculated_result | risk_bullet_list | multi_part_answer | clarification_needed | refusal>",
+  "reason": "<one sentence explanation>"
+}}
+
+Guidelines:
+- comparison: asks to compare two or more entities/periods
+- trend_analysis: asks about change over time or year-over-year direction
+- calculation: asks for a computed result (growth rate, difference, percentage)
+- risk_analysis: asks about risk factors, threats, or vulnerabilities
+- out_of_scope: asks about something not in SEC filings or legal docs
+- unclear: ambiguous, missing subject or time period"""
+
+    raw, pt, ct = _chat_with_usage(
+        [
+            {"role": "system", "content": "You are a query classifier. Return valid JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=200,
+        temperature=0.0,
+    )
+
+    classification = _DEFAULT_CLASSIFICATION.copy()
+    try:
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("```", 2)[1]
+            if cleaned.lstrip().startswith("json"):
+                cleaned = cleaned.lstrip()[4:]
+        parsed = json.loads(cleaned)
+        if parsed.get("query_type") in _VALID_QUERY_TYPES:
+            classification = parsed
+    except (json.JSONDecodeError, TypeError, AttributeError) as exc:
+        logger.warning("classify_node: JSON parse failed (%s), using default", exc)
+
+    logger.info("classify: type=%r requires_calc=%s", classification.get("query_type"), classification.get("requires_calculation"))
+    return {
+        "query_classification": classification,
+        "step_latencies": {"classify": round((time.time() - t0) * 1000)},
+        **_tok(pt, ct),
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Node 2: router
+# ════════════════════════════════════════════════════════════════════════════
 
 def router_node(state: AgentState) -> dict[str, Any]:
-    """
-    Choose the retrieval path for this query.
-
-    Routes:
-      'cag'    — Context-stuffing: all docs fit in the LLM context window.
-                 Gated on estimated total tokens < _CAG_TOKEN_THRESHOLD.
-                 Token estimate = total vectors in namespace × avg child tokens.
-                 More precise than file-count gating (ARCHITECTURE.md §5.3).
-
-      'graph'  — Neo4j GraphRAG: relational or comparative questions on a
-                 finance/graph-enabled collection. Detected by keyword heuristic
-                 + collection name check. Stub-safe: falls through to 'vector'
-                 if the graph layer isn't built yet.
-
-      'vector' — Default. Hybrid search + reranker (Files 7–8).
-
-    Note on comparison questions:
-      Comparison routing goes to 'vector'; the generate_node handles decomposition
-      into sub-queries and fresh per-fact retrieval. The router only picks the
-      *retrieval mechanism*, not the generation strategy.
-    """
+    """Choose the retrieval path (vector | cag | graph) and active collections."""
+    t0 = time.time()
     query: str = state.get("rewritten_query") or state["question"]
     collection: str = state["collection"]
 
-    # ── Cross-collection classification ──────────────────────────────────────
-    # When the caller passes collection='auto', classify which namespace(s) fit.
-    # Otherwise respect the caller's explicit collection choice.
     if collection == "auto":
         active = _classify_collections(query)
-        collection = active[0]   # primary namespace drives CAG/graph checks below
+        collection = active[0]
     else:
         active = [collection]
 
-    # ── CAG check ────────────────────────────────────────────────────────────
-    # CAG is only used for BROAD/AGGREGATE questions on small collections.
-    # Entity-specific queries (mentioning a company, project, or product by name)
-    # are routed to vector even when the collection is small, because:
-    #   - BM25 finds chunks that explicitly mention the named entity
-    #   - CAG dumps all chunks and risks cross-section misattribution in structured
-    #     documents (e.g. resume Work Experience + Projects sections mixed up)
+    # CAG check
     try:
         from backend.ingest.embed_index import _get_pinecone
         import backend.config as _cfg
         pc = _get_pinecone()
         stats = pc.Index(_cfg.PINECONE_INDEX_NAME).describe_index_stats()
         ns_stats = stats.namespaces or {}
-        vector_count = ns_stats.get(collection, {}).get("vector_count", 0) if isinstance(ns_stats.get(collection), dict) else getattr(ns_stats.get(collection), "vector_count", 0)
-        # Only child chunks get embedded for semantic search (roughly half the total).
+        ns_entry = ns_stats.get(collection, {})
+        vector_count = (
+            ns_entry.get("vector_count", 0) if isinstance(ns_entry, dict)
+            else getattr(ns_entry, "vector_count", 0)
+        )
         estimated_tokens = (vector_count // 2) * cfg.DEFAULT_CHUNK_CONFIG.child_tokens
         if 0 < estimated_tokens < _CAG_TOKEN_THRESHOLD:
             if _has_named_entity(query):
-                logger.info("router: vector (entity-specific query — bypassing CAG to prevent cross-section misattribution)")
+                logger.info("router: vector (entity-specific — bypassing CAG)")
             else:
-                logger.info("router: cag (est. %d tokens, broad query)", estimated_tokens)
-                return {"route": "cag", "collection": collection, "active_collections": active}
+                logger.info("router: cag (est. %d tokens)", estimated_tokens)
+                return {
+                    "route": "cag",
+                    "collection": collection,
+                    "active_collections": active,
+                    "step_latencies": {"router": round((time.time() - t0) * 1000)},
+                }
     except Exception as exc:
-        logger.warning("router: CAG check failed (%s), falling through", exc)
+        logger.warning("router: CAG check failed (%s)", exc)
 
-    # ── Graph check ───────────────────────────────────────────────────────────
-    # Finance collection + relational/comparative question → graph path.
-    finance_collections = {"sec_filings", "finance", "filings"}
-    if collection in finance_collections and _is_comparison(query):
-        logger.info("router: graph (relational query on finance collection)")
-        return {"route": "graph", "collection": collection, "active_collections": active}
+    # Graph check
+    finance_collections = {"sec_filings", "sec-filings", "finance", "filings"}
+    neo4j_configured = bool(cfg.NEO4J_URI)
+    if collection in finance_collections and _is_comparison(query) and neo4j_configured:
+        logger.info("router: graph")
+        return {
+            "route": "graph",
+            "collection": collection,
+            "active_collections": active,
+            "step_latencies": {"router": round((time.time() - t0) * 1000)},
+        }
 
-    # ── Default: vector ───────────────────────────────────────────────────────
-    logger.info("router: vector (active_collections=%r)", active)
-    return {"route": "vector", "collection": collection, "active_collections": active}
+    logger.info("router: vector (active=%r)", active)
+    return {
+        "route": "vector",
+        "collection": collection,
+        "active_collections": active,
+        "step_latencies": {"router": round((time.time() - t0) * 1000)},
+    }
 
 
-# ── Node 3a: retrieve (vector path) ─────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# Node 2b: access_check
+# ════════════════════════════════════════════════════════════════════════════
+
+def access_check_node(state: AgentState) -> dict[str, Any]:
+    """
+    RBAC gate: check that the requesting role is allowed to query each
+    active collection. If denied, set access_denied=True so the conditional
+    edge in graph.py short-circuits directly to generate_node, which returns
+    a structured denial message without touching Pinecone.
+
+    Roles and their allowed collections (from config.COLLECTION_ROLES):
+      admin   → all collections
+      finance → sec-filings only
+      legal   → legal-docs only
+      general → sec-filings only
+    """
+    t0 = time.time()
+    role: str = state.get("user_role", "general")
+    active: list[str] = state.get("active_collections") or []
+
+    denied: list[str] = []
+    for col in active:
+        allowed_roles = cfg.COLLECTION_ROLES.get(col, list(cfg.ALL_ROLES))
+        if role not in allowed_roles:
+            denied.append(col)
+
+    latency = {"access_check": round((time.time() - t0) * 1000)}
+
+    if denied:
+        denied_str = ", ".join(denied)
+        allowed_for_role = [
+            c for c, roles in cfg.COLLECTION_ROLES.items() if role in roles
+        ]
+        reason = (
+            f"Role '{role}' does not have permission to access: {denied_str}. "
+            f"Required role(s) for {denied[0]}: {cfg.COLLECTION_ROLES.get(denied[0], [])}. "
+            f"Your role ('{role}') has access to: {allowed_for_role or ['none']}."
+        )
+        logger.warning("access_check: denied role=%r collections=%r", role, denied)
+        return {
+            "access_denied": True,
+            "access_denial_reason": reason,
+            "step_latencies": latency,
+        }
+
+    logger.info("access_check: role=%r allowed for %r", role, active)
+    return {
+        "access_denied": False,
+        "access_denial_reason": "",
+        "step_latencies": latency,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Node 2c: decompose (multi-collection)
+# ════════════════════════════════════════════════════════════════════════════
+
+def decompose_node(state: AgentState) -> dict[str, Any]:
+    """Split a multi-collection question into one focused sub-question per namespace."""
+    t0 = time.time()
+    query: str = state.get("rewritten_query") or state["question"]
+    active: list[str] = (state.get("active_collections") or [])[:2]
+
+    if len(active) < 2:
+        return {
+            "collection_queries": [],
+            "step_latencies": {"decompose": round((time.time() - t0) * 1000)},
+        }
+
+    from backend.config import COLLECTION_REGISTRY
+    descriptions = "\n".join(
+        f'  "{name}": {COLLECTION_REGISTRY[name]}'
+        for name in active if name in COLLECTION_REGISTRY
+    )
+    collections_json = json.dumps(active)
+    prompt = (
+        f"Split the user's question into exactly {len(active)} focused sub-questions — "
+        f"one per collection below. Each sub-question must only ask for information "
+        f"that collection contains. Preserve company names and fiscal years.\n\n"
+        f"Retrieval hints:\n"
+        f'  sec-filings: target "SUMMARY RESULTS OF OPERATIONS", income statement, '
+        f'"total Revenue" or "Net sales" in millions for the fiscal year.\n'
+        f'  legal-docs: target the relevant legal provision keywords — '
+        f'"termination", "event of default" for credit agreements; '
+        f'"recoupment", "clawback" for compensation agreements.\n\n'
+        f"Collections:\n{descriptions}\n\n"
+        f"Original question: {query}\n\n"
+        f"Return ONLY a JSON array with {len(active)} objects:\n"
+        f'[{{"collection": "<exact name from {collections_json}>", "sub_question": "<focused standalone question>"}}]'
+    )
+    raw, pt, ct = _chat_with_usage(
+        [
+            {"role": "system", "content": "You decompose questions into collection-specific sub-questions. Return valid JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=300,
+    )
+
+    collection_queries: list[CollectionQuery] = []
+    try:
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("```", 2)[1]
+            if cleaned.lstrip().startswith("json"):
+                cleaned = cleaned.lstrip()[4:]
+        items = json.loads(cleaned)
+        if isinstance(items, list):
+            for item in items:
+                col = (item.get("collection") or "").strip()
+                sub_q = (item.get("sub_question") or "").strip()
+                if col in active and sub_q:
+                    collection_queries.append(CollectionQuery(collection=col, sub_question=sub_q))
+    except (json.JSONDecodeError, TypeError, AttributeError) as exc:
+        logger.warning("decompose: JSON parse failed (%s)", exc)
+
+    covered = {cq.collection for cq in collection_queries}
+    for col in active:
+        if col not in covered:
+            collection_queries.append(CollectionQuery(collection=col, sub_question=query))
+
+    return {
+        "collection_queries": collection_queries,
+        "step_latencies": {"decompose": round((time.time() - t0) * 1000)},
+        **_tok(pt, ct),
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Node 3a: retrieve_vector
+# ════════════════════════════════════════════════════════════════════════════
 
 def retrieve_vector_node(state: AgentState) -> dict[str, Any]:
-    """
-    Retrieve relevant chunks via hybrid search + Cohere reranking.
-
-    Single-collection path (default):
-      1. hybrid_search() — vector + BM25 fused with RRF (File 7).
-         Returns top 20 candidates from the collection namespace.
-      2. rerank() — Cohere cross-encoder scores candidates and returns top 8.
-
-    Multi-collection path (active_collections has 2 entries):
-      Searches both namespaces in parallel (each top_k=15), then re-applies
-      RRF fusion across both result sets before reranking the merged top-20.
-      This means a query like "Apple ROI" can pull from both 'finance' and
-      'legal' without the caller knowing which collection to pick upfront.
-    """
+    """Retrieve via hybrid search + Cohere reranking."""
+    t0 = time.time()
     query: str = state.get("rewritten_query") or state["question"]
     collection: str = state["collection"]
     scopes: list[str] = state.get("allowed_scopes", ["public"])
     active: list[str] = state.get("active_collections") or [collection]
+    facet_queries = _collection_queries_from_state(state)
+
+    if len(facet_queries) >= 2:
+        import concurrent.futures
+        all_chunks: list[ChunkResult] = []
+        seen: set[str] = set()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(facet_queries)) as pool:
+            futures = {
+                pool.submit(_retrieve_for_facet, cq.sub_question, cq.collection, scopes): cq
+                for cq in facet_queries
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                cq = futures[fut]
+                try:
+                    ranked = fut.result()
+                except Exception as exc:
+                    logger.warning("facet %r failed: %s", cq.collection, exc)
+                    ranked = []
+                for c in ranked:
+                    if c.chunk_id not in seen:
+                        seen.add(c.chunk_id)
+                        all_chunks.append(c)
+        return {
+            "retrieved_chunks": all_chunks,
+            "reusable_chunks": all_chunks,
+            "step_latencies": {"retrieve_vector": round((time.time() - t0) * 1000)},
+        }
 
     if len(active) >= 2:
-        # Parallel search across both collections, then fuse + rerank
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             futures = {pool.submit(hybrid_search, query, col, scopes, 15): col for col in active[:2]}
             all_candidates: list[ChunkResult] = []
             for fut in concurrent.futures.as_completed(futures):
-                col = futures[fut]
                 try:
                     all_candidates.extend(fut.result())
                 except Exception as exc:
-                    logger.warning("retrieve_vector_node: search on %r failed: %s", col, exc)
-
-        # Deduplicate by chunk_id (same chunk could theoretically appear in both)
+                    logger.warning("search on %r failed: %s", futures[fut], exc)
         seen: set[str] = set()
-        deduped = [c for c in all_candidates if not (c.chunk_id in seen or seen.add(c.chunk_id))]  # type: ignore[func-returns-value]
-        logger.info("retrieve_vector_node: multi-collection merge %r → %d candidates", active, len(deduped))
+        deduped = [c for c in all_candidates if not (c.chunk_id in seen or seen.add(c.chunk_id))]  # type: ignore
         reranked = rerank(query, deduped, top_n=8)
     else:
-        candidates = hybrid_search(query, collection, scopes, top_k=20)
-        reranked = rerank(query, candidates, top_n=8)
+        q_lower = query.lower()
+        needs_risk = any(w in q_lower for w in ("risk factor", "risk factors"))
+        needs_fin = any(w in q_lower for w in ("revenue", "sales", "income", "profit", "earnings"))
+        if needs_risk and needs_fin:
+            company_hint = next((k for k in _COMPANY_MARKERS if k in q_lower), query.split()[0] if query.split() else "company")
+            fin_sub = f"{company_hint} consolidated net sales total revenue income statement fiscal year summary results of operations"
+            risk_sub = f"{company_hint} risk factors Item 1A competition cybersecurity supply chain regulatory material adverse"
+            fin_chunks = _retrieve_for_facet(fin_sub, collection, scopes, top_n=6, section_filter="income_statement")
+            risk_chunks = _retrieve_for_facet(risk_sub, collection, scopes, top_n=6, section_filter="risk_factors")
+            seen: set[str] = set()
+            reranked = []
+            for c in fin_chunks + risk_chunks:
+                if c.chunk_id not in seen:
+                    seen.add(c.chunk_id)
+                    reranked.append(c)
+        else:
+            reranked = _retrieve_for_facet(query, collection, scopes, top_n=10)
 
     return {
         "retrieved_chunks": reranked,
         "reusable_chunks": reranked,
+        "step_latencies": {"retrieve_vector": round((time.time() - t0) * 1000)},
     }
 
 
-# ── Node 3b: retrieve (CAG path) ────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# Node 3b: retrieve_cag
+# ════════════════════════════════════════════════════════════════════════════
 
 def retrieve_cag_node(state: AgentState) -> dict[str, Any]:
-    """
-    Context-stuffing retrieval: fetch ALL content in the collection and return
-    it as context, bypassing vector search entirely.
-
-    WHY:
-      When the entire document set fits the LLM's context window (the router
-      already verified estimated_tokens < _CAG_TOKEN_THRESHOLD), ranked retrieval
-      introduces noise — wrong chunks silently omit facts. Stuffing the full
-      collection lets the LLM locate every relevant passage itself, making it
-      impossible to miss entries like a resume work experience section that ranks
-      below the top-N cutoff in vector search.
-
-    HOW:
-      1. List every vector ID in the Pinecone namespace.
-      2. Batch-fetch metadata; keep only parent chunks (is_parent=True).
-         Parents carry the full section text; using them avoids duplicate content
-         since each parent already contains its children's text.
-      3. If no parent chunks exist (e.g. collection indexed without parent-doc
-         chunking), fall back to all child chunks.
-      4. Apply access_scope filter so permission-aware retrieval still holds.
-
-    Returns all chunks with score=1.0 (all equally relevant — LLM decides).
-    Falls back to vector retrieval on any Pinecone error.
-    """
+    """Context-stuffing: fetch ALL content in the collection."""
+    t0 = time.time()
     from backend.ingest.embed_index import _get_pinecone
     import backend.config as _cfg
 
@@ -434,328 +1030,719 @@ def retrieve_cag_node(state: AgentState) -> dict[str, Any]:
     try:
         pc = _get_pinecone()
         index = pc.Index(_cfg.PINECONE_INDEX_NAME)
-
-        # Gather every vector ID in this namespace
         all_ids: list[str] = []
         for page in index.list(namespace=collection):
             all_ids.extend(item.id for item in page.vectors)
 
         if not all_ids:
-            logger.warning("retrieve_cag_node: empty namespace=%r, falling back", collection)
-            return retrieve_vector_node(state)
+            logger.warning("retrieve_cag_node: empty namespace=%r", collection)
+            result = retrieve_vector_node(state)
+            result["step_latencies"] = {"retrieve_cag": round((time.time() - t0) * 1000)}
+            return result
 
-        # Batch-fetch all metadata; collect parent chunks
         parent_chunks: list[ChunkResult] = []
         child_chunks: list[ChunkResult] = []
         batch_size = 200
-
         for start in range(0, len(all_ids), batch_size):
-            resp = index.fetch(ids=all_ids[start : start + batch_size], namespace=collection)
+            resp = index.fetch(ids=all_ids[start:start + batch_size], namespace=collection)
             for vid, vec in resp.vectors.items():
                 meta = vec.metadata or {}
-                # Access scope filter
                 chunk_scopes = meta.get("access_scope", ["public"])
                 if not any(s in chunk_scopes for s in scopes):
                     continue
                 cr = ChunkResult(
-                    chunk_id=vid,
-                    parent_id=meta.get("parent_id") or None,
-                    doc_id=meta.get("doc_id", ""),
-                    filename=meta.get("filename", ""),
-                    collection=collection,
-                    source_text=meta.get("source_text", ""),
-                    is_parent=bool(meta.get("is_parent", False)),
-                    score=1.0,
-                    metadata=meta,
+                    chunk_id=vid, parent_id=meta.get("parent_id") or None,
+                    doc_id=meta.get("doc_id", ""), filename=meta.get("filename", ""),
+                    collection=collection, source_text=meta.get("source_text", ""),
+                    is_parent=bool(meta.get("is_parent", False)), score=1.0,
+                    metadata={**meta, "_vec": list(vec.values) if vec.values else []},
                 )
-                if cr.is_parent:
-                    parent_chunks.append(cr)
-                else:
-                    child_chunks.append(cr)
+                (parent_chunks if cr.is_parent else child_chunks).append(cr)
 
-        # Prefer parents (full context); fall back to children if collection
-        # was indexed without parent-document chunking
         chunks = parent_chunks if parent_chunks else child_chunks
-
         if not chunks:
-            logger.warning("retrieve_cag_node: no accessible chunks, falling back to vector")
-            return retrieve_vector_node(state)
+            result = retrieve_vector_node(state)
+            result["step_latencies"] = {"retrieve_cag": round((time.time() - t0) * 1000)}
+            return result
 
-        logger.info("retrieve_cag_node: loaded %d chunks for CAG (%d parents, %d children)",
-                    len(chunks), len(parent_chunks), len(child_chunks))
+        # Rank by cosine similarity
+        query: str = state.get("rewritten_query") or state["question"]
+        try:
+            import numpy as np
+            model = cfg.get_embedding_model(collection)
+            q_emb = _llm().embeddings.create(input=[query], model=model).data[0].embedding
+            q_vec = np.array(q_emb, dtype=np.float32)
+            q_norm = q_vec / (np.linalg.norm(q_vec) + 1e-9)
+            scored = []
+            for c in chunks:
+                cached = c.metadata.get("_vec") if c.metadata else None
+                if cached:
+                    v = np.array(cached, dtype=np.float32)
+                else:
+                    v = np.array(_llm().embeddings.create(input=[c.source_text[:512]], model=model).data[0].embedding, dtype=np.float32)
+                v_norm = v / (np.linalg.norm(v) + 1e-9)
+                scored.append((float(np.dot(q_norm, v_norm)), c))
+            chunks = [c for _, c in sorted(scored, key=lambda x: x[0], reverse=True)]
+        except Exception as exc:
+            logger.warning("retrieve_cag_node: ranking failed (%s)", exc)
+
         return {
             "retrieved_chunks": chunks,
             "reusable_chunks": chunks,
+            "step_latencies": {"retrieve_cag": round((time.time() - t0) * 1000)},
         }
-
     except Exception as exc:
-        logger.warning("retrieve_cag_node: failed (%s), falling back to vector", exc)
-        return retrieve_vector_node(state)
+        logger.warning("retrieve_cag_node: failed (%s)", exc)
+        result = retrieve_vector_node(state)
+        result["step_latencies"] = {"retrieve_cag": round((time.time() - t0) * 1000)}
+        return result
 
 
-# ── Node 3c: retrieve (graph path) ──────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# Node 3c: retrieve_graph
+# ════════════════════════════════════════════════════════════════════════════
 
 def retrieve_graph_node(state: AgentState) -> dict[str, Any]:
-    """
-    Retrieve from the Neo4j knowledge graph for relational/comparative questions.
-
-    Calls graph_rag.query.graph_query() which extracts structured params from
-    the question (company names, metric, year) and runs the appropriate Cypher
-    template. Results come back as ChunkResult objects — identical interface to
-    vector retrieval, so grade_node and generate_node need no special handling.
-
-    Falls back to vector retrieval if Neo4j returns no results (e.g. the
-    entities haven't been ingested into the graph yet).
-    """
+    """Retrieve from Neo4j for relational/comparative questions."""
+    t0 = time.time()
     from backend.graph_rag.query import graph_query
     from backend.graph_rag.schema import get_schema
 
     query: str = state.get("rewritten_query") or state["question"]
     collection: str = state["collection"]
     schema = get_schema(collection)
-
     results = graph_query(query, schema, collection)
 
     if results:
         return {
             "retrieved_chunks": results,
             "reusable_chunks": results,
+            "step_latencies": {"retrieve_graph": round((time.time() - t0) * 1000)},
         }
+    logger.warning("retrieve_graph_node: no results, falling back to vector")
+    result = retrieve_vector_node(state)
+    result["step_latencies"] = {"retrieve_graph": round((time.time() - t0) * 1000)}
+    return result
 
-    # Graph returned nothing — fall back to hybrid vector search
-    logger.warning("retrieve_graph_node: no graph results, falling back to vector")
-    return retrieve_vector_node(state)
 
+# ════════════════════════════════════════════════════════════════════════════
+# Node 4: grade
+# ════════════════════════════════════════════════════════════════════════════
 
-# ── Node 4: grade ────────────────────────────────────────────────────────────
+def _detect_conflicts(chunks: list[ChunkResult], query: str) -> tuple[bool, str]:
+    """
+    Detect conflicting numeric values for the same metric across chunks.
+    Returns (conflict_detected, reason_string).
+    """
+    # Extract (value, year) pairs for financial metrics
+    # Pattern: dollar amount followed by "million" or "billion" + optional year
+    amount_pattern = re.compile(
+        r"\$?([\d,]+(?:\.\d+)?)\s*(million|billion|M|B)\b",
+        re.IGNORECASE,
+    )
+    year_pattern = re.compile(r"\b(20\d{2}|19\d{2})\b")
+
+    # Normalize to millions
+    def normalize(value: float, unit: str) -> float:
+        u = unit.lower()
+        if u in ("billion", "b"):
+            return value * 1000
+        return value
+
+    # Collect (normalized_value, year) per chunk
+    chunk_values: list[tuple[float, str]] = []
+    for c in chunks[:6]:
+        amounts = amount_pattern.findall(c.source_text)
+        years = year_pattern.findall(c.source_text)
+        year = years[0] if years else "unknown"
+        for val_str, unit in amounts:
+            try:
+                val = normalize(float(val_str.replace(",", "")), unit)
+                if val > 1000:  # only flag values that look like revenue-scale numbers
+                    chunk_values.append((val, year))
+            except ValueError:
+                pass
+
+    if len(chunk_values) < 2:
+        return False, ""
+
+    # Check if two chunks have the same year but different values (>20% difference)
+    from collections import defaultdict
+    by_year: dict[str, list[float]] = defaultdict(list)
+    for val, year in chunk_values:
+        by_year[year].append(val)
+
+    for year, vals in by_year.items():
+        if year == "unknown":
+            continue
+        unique_vals = list(set(round(v, -2) for v in vals))  # round to nearest 100M
+        if len(unique_vals) >= 2:
+            min_v, max_v = min(unique_vals), max(unique_vals)
+            if max_v > 0 and (max_v - min_v) / max_v > 0.15:  # >15% difference
+                return True, (
+                    f"Multiple different values found for {year}: "
+                    f"${min_v:,.0f}M and ${max_v:,.0f}M. "
+                    f"These may refer to different periods, segments, or amended filings."
+                )
+
+    return False, ""
+
 
 def grade_node(state: AgentState) -> dict[str, Any]:
     """
-    Assess whether the retrieved chunks are sufficient to answer the question.
+    Grade retrieved context quality with conflict detection and answerability assessment.
 
-    WHY:
-      Retrieval can fail: the corpus might not contain the answer, the query
-      might have been ambiguous, or BM25 + reranking might have pulled
-      tangentially relevant chunks. Grading closes the agentic loop: instead
-      of generating a hallucinated answer from bad context, the agent retries
-      with a reformulated query.
-
-    HOW:
-      Prompt gpt-4o-mini with the question and chunk texts. Ask for a one-word
-      verdict: 'sufficient' or 'insufficient'. Temperature=0 for determinism.
-
-    Retry cap:
-      retry_count is incremented here. The graph's conditional edge (graph.py)
-      routes to generate if grade=='sufficient' OR retry_count>=_MAX_RETRIES,
-      preventing infinite loops when the corpus genuinely lacks the answer.
+    Returns:
+      grade           — 'sufficient' | 'insufficient'
+      answerability   — 'sufficient' | 'insufficient' | 'conflicting'
+      conflict_detected — bool
+      missing_info    — list of what's absent
     """
+    t0 = time.time()
     query: str = state.get("rewritten_query") or state["question"]
     chunks: list[ChunkResult] = state.get("retrieved_chunks", [])
     retry_count: int = state.get("retry_count", 0)
+    facet_queries = _collection_queries_from_state(state)
 
     if not chunks:
-        return {"grade": "insufficient", "retry_count": retry_count + 1}
+        return {
+            "grade": "insufficient",
+            "answerability": "insufficient",
+            "answerability_reason": "No context was retrieved from the document store.",
+            "missing_info": ["No relevant documents found"],
+            "conflict_detected": False,
+            "retry_count": retry_count + 1,
+            "facet_grades": [],
+            "step_latencies": {"grade": round((time.time() - t0) * 1000)},
+        }
 
+    # Conflict detection
+    conflict_detected, conflict_reason = _detect_conflicts(chunks, query)
+
+    if len(facet_queries) >= 2:
+        facet_grades: list[dict[str, Any]] = []
+        total_pt = total_ct = 0
+        all_sufficient = True
+
+        for cq in facet_queries:
+            facet_chunks = [c for c in chunks if c.collection == cq.collection]
+            if not facet_chunks:
+                facet_grades.append({
+                    "collection": cq.collection, "sub_question": cq.sub_question,
+                    "grade": "insufficient", "chunk_count": 0,
+                })
+                all_sufficient = False
+                continue
+
+            context = _chunks_to_context(facet_chunks, max_chunks=_FACET_TOP_K)
+            verdict, pt, ct = _chat_with_usage(
+                [
+                    {"role": "system", "content": "Retrieval grader. Reply with exactly: 'sufficient' or 'insufficient'."},
+                    {"role": "user", "content": f"Question: {cq.sub_question}\n\nPassages:\n{context}"},
+                ],
+                max_tokens=10,
+            )
+            total_pt += pt; total_ct += ct
+            facet_grade = "sufficient" if "sufficient" in verdict.lower() else "insufficient"
+            if facet_grade != "sufficient":
+                all_sufficient = False
+            facet_grades.append({
+                "collection": cq.collection, "sub_question": cq.sub_question,
+                "grade": facet_grade, "chunk_count": len(facet_chunks),
+            })
+
+        grade = "sufficient" if all_sufficient else "insufficient"
+        answerability = "conflicting" if conflict_detected else grade
+        return {
+            "grade": grade,
+            "answerability": answerability,
+            "answerability_reason": conflict_reason if conflict_detected else "",
+            "conflict_detected": conflict_detected,
+            "missing_info": [
+                f"{fg['collection']}: insufficient context" for fg in facet_grades if fg["grade"] == "insufficient"
+            ],
+            "retry_count": retry_count + 1,
+            "facet_grades": facet_grades,
+            "step_latencies": {"grade": round((time.time() - t0) * 1000)},
+            **_tok(total_pt, total_ct),
+        }
+
+    # Single-collection grading
     context = _chunks_to_context(chunks, max_chunks=8)
-    verdict = _chat(
+    verdict, pt, ct = _chat_with_usage(
         [
-            {
-                "role": "system",
-                "content": (
-                    "You are a retrieval grader. Given a question and retrieved passages, "
-                    "decide if the passages contain enough information to answer the question. "
-                    "Reply with exactly one word: 'sufficient' or 'insufficient'."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Question: {query}\n\nPassages:\n{context}",
-            },
+            {"role": "system", "content": (
+                "Retrieval grader. Given a question and passages, decide if the passages "
+                "contain enough information to answer it. "
+                "Reply with exactly one word: 'sufficient' or 'insufficient'."
+            )},
+            {"role": "user", "content": f"Question: {query}\n\nPassages:\n{context}"},
         ],
         max_tokens=10,
-    ).lower()
+    )
+    grade = "sufficient" if "sufficient" in verdict.lower() else "insufficient"
+    answerability = "conflicting" if conflict_detected else grade
 
-    grade = "sufficient" if "sufficient" in verdict else "insufficient"
-    logger.info("grade: %s (retry %d)", grade, retry_count)
-    return {"grade": grade, "retry_count": retry_count + 1}
+    # Determine missing info for insufficient grade
+    missing_info: list[str] = []
+    if grade == "insufficient":
+        years = re.findall(r"\b(20\d{2})\b", query)
+        if years:
+            missing_info.append(f"Data for fiscal year {', '.join(years)} not found in indexed documents")
+        else:
+            missing_info.append("Relevant passages not found in the indexed document corpus")
+
+    logger.info("grade: %s answerability=%s conflict=%s retry=%d", grade, answerability, conflict_detected, retry_count)
+    return {
+        "grade": grade,
+        "answerability": answerability,
+        "answerability_reason": conflict_reason if conflict_detected else "",
+        "conflict_detected": conflict_detected,
+        "missing_info": missing_info,
+        "retry_count": retry_count + 1,
+        "facet_grades": [],
+        "step_latencies": {"grade": round((time.time() - t0) * 1000)},
+        **_tok(pt, ct),
+    }
 
 
-# ── Node 5: generate ─────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# Node 4b: validate_numbers
+# ════════════════════════════════════════════════════════════════════════════
+
+def validate_numbers_node(state: AgentState) -> dict[str, Any]:
+    """
+    Deterministic numeric validation for financial calculation queries.
+
+    Workflow:
+      1. Ask LLM to extract numeric values from retrieved chunks (structured JSON).
+      2. Perform all arithmetic in Python — never let the LLM do math.
+      3. Return structured validation result that generate_node uses to
+         produce a precise, citable answer with explicit formula shown.
+
+    This prevents the LLM from silently computing wrong percentages or
+    rounding figures incorrectly.
+    """
+    t0 = time.time()
+    query: str = state.get("rewritten_query") or state["question"]
+    chunks: list[ChunkResult] = state.get("retrieved_chunks", [])
+    context = _chunks_to_context(chunks, max_chunks=8)
+
+    extraction_prompt = f"""Extract ALL numeric financial values from the context below.
+Return valid JSON only.
+
+Context:
+{context}
+
+Question: {query}
+
+Return this JSON structure (multiple periods/companies if present):
+{{
+  "metric": "<revenue | net_income | operating_income | eps | other>",
+  "company": "<company name>",
+  "periods": [
+    {{
+      "label": "<e.g. FY2024 or Q3 2025>",
+      "year": <integer year>,
+      "value": <numeric value in millions USD>,
+      "unit": "millions USD",
+      "source_chunk_idx": <0-based index of source chunk>
+    }}
+  ]
+}}
+
+Rules:
+- Convert billions to millions (multiply by 1000)
+- Extract from comparison columns in tables (prior year data)
+- If multiple metrics present, extract the one most relevant to the question
+- If no numeric values found, return {{"metric": "unknown", "company": "", "periods": []}}"""
+
+    raw, pt, ct = _chat_with_usage(
+        [
+            {"role": "system", "content": "You extract financial numbers from text. Return valid JSON only."},
+            {"role": "user", "content": extraction_prompt},
+        ],
+        max_tokens=400,
+        temperature=0.0,
+    )
+
+    extraction: dict = {"metric": "unknown", "company": "", "periods": []}
+    try:
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("```", 2)[1]
+            if cleaned.lstrip().startswith("json"):
+                cleaned = cleaned.lstrip()[4:]
+        extraction = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError, AttributeError) as exc:
+        logger.warning("validate_numbers_node: extraction parse failed (%s)", exc)
+
+    # Deterministic calculation in Python
+    periods = extraction.get("periods", [])
+    calculation: dict = {}
+
+    if len(periods) >= 2:
+        # Sort by year to get chronological order
+        sorted_periods = sorted(periods, key=lambda p: p.get("year", 0))
+        earlier = sorted_periods[0]
+        later = sorted_periods[-1]
+
+        v_earlier = float(earlier.get("value", 0))
+        v_later = float(later.get("value", 0))
+
+        if v_earlier > 0:
+            abs_change = v_later - v_earlier
+            pct_change = (abs_change / v_earlier) * 100
+            calculation = {
+                "from_period": earlier.get("label", ""),
+                "to_period": later.get("label", ""),
+                "from_value": v_earlier,
+                "to_value": v_later,
+                "absolute_change": round(abs_change, 2),
+                "percentage_change": round(pct_change, 2),
+                "formula": (
+                    f"({v_later:,.0f} - {v_earlier:,.0f}) / {v_earlier:,.0f} × 100 "
+                    f"= {pct_change:+.2f}%"
+                ),
+                "direction": "increase" if abs_change > 0 else "decrease",
+            }
+            logger.info(
+                "validate_numbers: %s %s→%s Δ%.1f%%",
+                extraction.get("metric"), earlier.get("label"), later.get("label"), pct_change,
+            )
+
+    numeric_validation = {
+        "metric": extraction.get("metric", "unknown"),
+        "company": extraction.get("company", ""),
+        "periods": periods,
+        "calculation": calculation,
+        "validated": bool(calculation),
+    }
+
+    return {
+        "numeric_validation": numeric_validation,
+        "step_latencies": {"validate_numbers": round((time.time() - t0) * 1000)},
+        **_tok(pt, ct),
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Node 5: generate
+# ════════════════════════════════════════════════════════════════════════════
+
+# Query-type → system prompt template
+_QT_SYSTEM_PROMPTS: dict[str, str] = {
+    "factual_lookup": (
+        "You are a precise financial and legal document analyst. "
+        "Answer the question DIRECTLY with a single clear answer including: "
+        "the exact value, its unit, the fiscal period, and the source. "
+        "Be concise. Cite the specific document section."
+    ),
+    "comparison": (
+        "You are a financial analyst producing a structured comparison. "
+        "Present results in a MARKDOWN TABLE with columns for the entities/periods compared. "
+        "After the table, add 2-3 sentences interpreting the comparison. "
+        "Cite the source document for each figure."
+    ),
+    "trend_analysis": (
+        "You are a financial analyst. Answer the question DIRECTLY in 1-2 sentences — "
+        "state the key figure, direction of change, and prior year value from the context. "
+        "Only include drivers or explanations if they are explicitly stated in the retrieved text. "
+        "Do NOT add context from your training data. Cite the source document."
+    ),
+    "calculation": (
+        "You are a financial analyst presenting a calculated result. "
+        "Lead with the DIRECT ANSWER: state the result and its unit in the first sentence. "
+        "Then show the values used and the formula — sourced only from the retrieved context. "
+        "If a pre-computed calculation is provided in the context, use it exactly. "
+        "Never perform arithmetic mentally. Never add explanations not in the context."
+    ),
+    "risk_analysis": (
+        "You are a risk analyst. Present risks as a BULLET LIST grouped by category. "
+        "For each risk: state the category, describe the risk using only language from "
+        "the retrieved text, and cite the source section. "
+        "Do not add risk factors from your training knowledge."
+    ),
+    "summarization": (
+        "You are a document summarizer. Produce a structured summary covering "
+        "key facts, financial highlights, and notable points — all drawn strictly from "
+        "the retrieved context. Use headers. Cite sources for specific claims. "
+        "Do not add background knowledge."
+    ),
+    "multi_document_reasoning": (
+        "You are a cross-document analyst. Answer the question by synthesizing "
+        "information strictly from the provided sources. Clearly indicate which document "
+        "each piece of information comes from. Use headers when sources are distinct. "
+        "Do not add information from your training data."
+    ),
+}
+
+_EXTRACTIVE_RULES = (
+    "\n\nEXTRACTION RULES (always apply):\n"
+    "1. LEGAL PROVISIONS: Extract ALL relevant clauses verbatim or in close paraphrase — "
+    "even references to external policies by name are valid answers.\n"
+    "2. FINANCIAL DATA: In 10-K filings, prior-year columns contain historical data. "
+    "Extract figures for the requested year from the correct column. "
+    "Always prefer CONSOLIDATED totals over segment figures unless asked.\n"
+    "3. RISK FACTORS: Report all risk categories mentioned, even high-level ones.\n"
+    "4. NEVER say 'no information' if ANY relevant text exists. Report what IS there.\n"
+    "5. Never fabricate numbers, names, or terms not in the context.\n"
+    "6. GROUNDING: Every factual claim in your answer MUST be traceable to the provided "
+    "context. Do NOT add explanations, drivers, or background knowledge from your training "
+    "data. If the context does not explain WHY something happened, do not speculate — "
+    "omit the explanation entirely or say 'the filing does not state the reason'."
+)
+
 
 def generate_node(state: AgentState) -> dict[str, Any]:
     """
-    Generate the final answer, grounded in retrieved source chunks.
+    Generate the final answer, using query classification to choose the right
+    prompt style and numeric_validation results for calculation queries.
 
-    Two generation paths:
-
-    COMPARISON PATH (detected by keyword heuristic on rewritten_query):
-      Per ARCHITECTURE.md §5.9: "the agent decomposes comparison questions into
-      sub-queries, retrieves each fact fresh from source, compares on grounded
-      facts — never reuses a prior generated answer."
-
-      Steps:
-        1. LLM decomposes the comparison question into 2 sub-queries.
-        2. Each sub-query runs through hybrid_search + rerank independently.
-        3. Both fresh result sets are combined as context.
-        4. Final answer is generated from the grounded combined context.
-
-      WHY FRESH RETRIEVAL:
-        If we retrieved "Company A revenue: $5B" in one turn and now ask
-        "compare A vs B", reusing the cached $5B answer risks propagating
-        a number that may have been hallucinated or retrieved from the wrong
-        document. Fresh retrieval from the source document is always safer.
-
-    STANDARD PATH:
-      Combines retrieved_chunks (current turn) with reusable_chunks from prior
-      turns, deduplicates by chunk_id, and generates from the merged context.
-      Source chunks are safe to reuse — they are direct document quotes, not
-      model-generated text.
-
-    Returns:
-      answer             — the generated response string.
-      citations          — one Citation per chunk used in the answer.
-      conversation_history — [new ConversationTurn] appended via additive reducer.
+    Handles four special cases before normal generation:
+      1. access_denied   → structured denial message
+      2. out_of_scope    → scope explanation
+      3. unclear         → clarification request
+      4. conflicting     → surfaces the conflict with explanation
     """
+    t0 = time.time()
     query: str = state.get("rewritten_query") or state["question"]
     collection: str = state["collection"]
     scopes: list[str] = state.get("allowed_scopes", ["public"])
     current_chunks: list[ChunkResult] = state.get("retrieved_chunks", [])
     prior_chunks: list[ChunkResult] = state.get("reusable_chunks", [])
-
     route: str = state.get("route", "vector")
+    facet_queries = _collection_queries_from_state(state)
+    qc: dict = state.get("query_classification") or {}
+    query_type: str = qc.get("query_type", "factual_lookup")
+    step_latencies: dict = state.get("step_latencies") or {}
 
-    # ── Comparison path: decompose → retrieve fresh ───────────────────────────
-    if _is_comparison(query):
+    # ── Case 1: access denied ────────────────────────────────────────────────
+    if state.get("access_denied"):
+        reason = state.get("access_denial_reason", "Access denied.")
+        answer = (
+            f"**Access Denied**\n\n{reason}\n\n"
+            f"Please contact your administrator if you need access to additional collections."
+        )
+        return _generate_result(answer, [], state, t0, step_latencies, 0, 0)
+
+    # ── Case 2: out_of_scope ─────────────────────────────────────────────────
+    if query_type == "out_of_scope":
+        answer = (
+            "**Out of scope**\n\n"
+            "This question falls outside the indexed document collections. "
+            "The available collections cover:\n"
+            "- **sec-filings**: SEC 10-K annual reports (AAPL, MSFT, NVDA, GOOGL, AMZN, TSLA, META, JPM, WMT, JNJ, PFE, XOM, DIS, KO, V)\n"
+            "- **legal-docs**: Material contracts and EX-10 exhibits (TSLA, MSFT, JPM, META, WMT)\n\n"
+            f"Your question: *{query}*\n\n"
+            "Please rephrase to focus on financials, risk factors, MD&A, or legal agreements for the companies above."
+        )
+        return _generate_result(answer, [], state, t0, step_latencies, 0, 0)
+
+    # ── Case 3: unclear ──────────────────────────────────────────────────────
+    if query_type == "unclear":
+        answer = (
+            "**Clarification needed**\n\n"
+            f"Your question *\"{query}\"* is missing some details. Please specify:\n"
+            "- Which company (e.g. Microsoft, Apple, JPMorgan)?\n"
+            "- Which fiscal year or period?\n"
+            "- What specific metric or topic (revenue, risk factors, clawback conditions)?\n\n"
+            "Example: *\"What was Microsoft's total revenue in fiscal year 2025?\"*"
+        )
+        return _generate_result(answer, [], state, t0, step_latencies, 0, 0)
+
+    # ── Gather context ───────────────────────────────────────────────────────
+    original_question: str = state["question"]
+    if (_is_comparison(query) or _is_comparison(original_question)) and len(facet_queries) < 2:
         context_chunks = _comparison_retrieval(query, collection, scopes)
     else:
-        # Merge current + prior, deduplicate by chunk_id.
         seen: set[str] = set()
         merged: list[ChunkResult] = []
         for c in current_chunks + prior_chunks:
             if c.chunk_id not in seen:
                 seen.add(c.chunk_id)
                 merged.append(c)
-        # CAG already fetched ALL content — don't cap it; vector uses top 8.
         context_chunks = merged if route == "cag" else merged[:8]
 
     if not context_chunks:
-        return {
-            "answer": "I don't have enough information in the provided documents to answer this question.",
-            "citations": [],
-            "conversation_history": [
-                ConversationTurn(
-                    question=state["question"],
-                    rewritten_query=state.get("rewritten_query"),
-                    retrieved_chunks=[],
-                )
-            ],
-        }
-
-    # CAG: pass all chunks grouped by document so company headers and their
-    # adjacent bullet-point chunks appear contiguously in the context.
-    # Vector/graph: numbered list is fine since chunks are already the top-ranked.
-    context = _chunks_to_context(context_chunks, group_by_doc=(route == "cag"))
-
-    # CAG gets a synthesis-oriented prompt because content is spread across many
-    # passages and the LLM needs to aggregate across chunks (e.g. company name in
-    # one chunk, bullet points in an adjacent chunk). Vector/graph use a stricter
-    # prompt because they receive only the top-scored chunks.
-    if route == "cag":
-        system_prompt = (
-            "You are a precise, helpful assistant with access to a document collection. "
-            "The context below contains ALL passages from ALL documents in the collection, "
-            "presented in their original document order. "
-            "Rules you MUST follow:\n"
-            "1. Read EVERY passage from EVERY document before composing your answer. "
-            "Do not stop after the first document — the collection may contain multiple "
-            "files and important information may appear in later documents.\n"
-            "2. COMPLETENESS: For questions asking to list or summarise all items "
-            "(e.g. work experiences, skills, projects), include EVERY distinct item "
-            "found across ALL documents. Missing even one item is an error.\n"
-            "3. DEDUPLICATION: A document may describe the same employer in multiple "
-            "sections (e.g. 'Work Experience', 'Applied Data Science Experience'). "
-            "When the same company name appears more than once, MERGE all mentions into "
-            "ONE entry. If the company had multiple distinct roles, list each as a "
-            "sub-item — never list the same employer twice as separate top-level entries.\n"
-            "4. ATTRIBUTION: Only attribute projects or achievements to a company if they "
-            "are EXPLICITLY stated under that company's section. Never pull details from "
-            "a standalone Projects section and attribute them to a Work Experience entry.\n"
-            "5. HONESTY: If an entry has limited detail, report exactly what is stated; "
-            "do not invent or infer responsibilities.\n"
-            "6. Never speculate. Only report what the text explicitly says."
+        missing = state.get("missing_info") or []
+        missing_str = "; ".join(missing) if missing else "the indexed documents"
+        answer = (
+            f"**Insufficient context**\n\n"
+            f"The available documents do not contain enough evidence to answer this confidently.\n\n"
+            f"Missing: {missing_str}\n\n"
+            f"*Original question: {query}*"
         )
+        return _generate_result(answer, [], state, t0, step_latencies, 0, 0)
+
+    # ── Case 4: conflicting context ──────────────────────────────────────────
+    conflict_detected = state.get("conflict_detected", False)
+    conflict_reason = state.get("answerability_reason", "")
+
+    # ── Numeric validation injection ─────────────────────────────────────────
+    numeric_validation: dict = state.get("numeric_validation") or {}
+    numeric_context_block = ""
+    if numeric_validation.get("validated") and numeric_validation.get("calculation"):
+        calc = numeric_validation["calculation"]
+        periods = numeric_validation.get("periods", [])
+        periods_str = "\n".join(
+            f"  - {p.get('label', '')}: ${p.get('value', 0):,.0f}M ({p.get('unit', '')})"
+            for p in periods
+        )
+        numeric_context_block = (
+            f"\n\n[VALIDATED CALCULATION — use these exact figures]\n"
+            f"Metric: {numeric_validation.get('metric', '')}\n"
+            f"Company: {numeric_validation.get('company', '')}\n"
+            f"Extracted values:\n{periods_str}\n"
+            f"Formula: {calc.get('formula', '')}\n"
+            f"Result: {calc.get('direction', '')} of {abs(calc.get('percentage_change', 0)):.2f}% "
+            f"(${abs(calc.get('absolute_change', 0)):,.0f}M absolute change)\n"
+        )
+
+    # ── Build prompt ─────────────────────────────────────────────────────────
+    if len(facet_queries) >= 2:
+        sections: list[str] = []
+        for i, cq in enumerate(facet_queries, 1):
+            facet_chunks = [c for c in context_chunks if c.collection == cq.collection]
+            section_ctx = _chunks_to_context(facet_chunks) if facet_chunks else "(no passages retrieved)"
+            sections.append(
+                f"### Part {i}: {cq.collection}\n"
+                f"Sub-question: {cq.sub_question}\n\n"
+                f"Context:\n{section_ctx}"
+            )
+        context = "\n\n".join(sections) + numeric_context_block
+        system_prompt = (
+            "You are a precise financial and legal document analyst answering a multi-part question. "
+            "Answer EACH part separately using ONLY its own context section. "
+            "Use markdown headers matching the part labels."
+            + _EXTRACTIVE_RULES
+        )
+        if conflict_detected:
+            system_prompt += (
+                f"\n\nWARNING — CONFLICTING VALUES DETECTED: {conflict_reason} "
+                f"Present both values to the user and note the discrepancy. Do NOT merge them."
+            )
+        user_content = f"{context}\n\nOriginal question: {query}\n\nProvide a structured answer addressing every part."
+
     else:
-        system_prompt = (
-            "You are a helpful assistant. Answer the question using ONLY the provided context. "
-            "Attribute information only to the source it explicitly appears under. "
-            "If the context does not contain sufficient information, say so clearly. "
-            "Do not fabricate or infer information."
-        )
+        context = _chunks_to_context(context_chunks, group_by_doc=(route == "cag")) + numeric_context_block
+        base_prompt = _QT_SYSTEM_PROMPTS.get(query_type, _QT_SYSTEM_PROMPTS["factual_lookup"])
+        if route == "cag":
+            system_prompt = (
+                "You are a precise, helpful assistant with access to a document collection. "
+                "Read EVERY passage before composing your answer. "
+                "Deduplicate: same employer mentioned in multiple sections → merge into ONE entry. "
+                "Never fabricate."
+            )
+        else:
+            system_prompt = base_prompt + _EXTRACTIVE_RULES
+            if conflict_detected:
+                system_prompt += (
+                    f"\n\nWARNING — CONFLICTING VALUES DETECTED: {conflict_reason} "
+                    f"Present both values and note the discrepancy instead of picking one."
+                )
+        user_content = f"Context:\n{context}\n\nQuestion: {query}"
 
-    answer = _chat(
+    answer, gen_pt, gen_ct = _chat_with_usage(
         [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"},
+            {"role": "user", "content": user_content},
         ],
         max_tokens=2000,
         temperature=0.1,
     )
 
-    citations = [
-        Citation(
-            chunk_id=c.chunk_id,
-            doc_id=c.doc_id,
-            filename=c.filename,
-            collection=c.collection,
-            source_text=c.source_text,
-        )
-        for c in context_chunks
-    ]
+    # Prepend conflict notice to answer if needed
+    if conflict_detected and "CONFLICTING" not in answer[:200]:
+        answer = (
+            f"> **Note:** Conflicting values detected in retrieved context. "
+            f"{conflict_reason}\n\n"
+        ) + answer
+
+    citations = [_build_citation(c) for c in context_chunks]
+    return _generate_result(answer, citations, state, t0, step_latencies, gen_pt, gen_ct)
+
+
+def _generate_result(
+    answer: str,
+    citations: list[Citation],
+    state: AgentState,
+    t0: float,
+    step_latencies: dict,
+    gen_pt: int,
+    gen_ct: int,
+) -> dict[str, Any]:
+    """Assemble the generate node return dict including metrics."""
+    gen_latency_ms = round((time.time() - t0) * 1000)
+    all_latencies = {**step_latencies, "generate": gen_latency_ms}
+
+    # Aggregate token counts from state + this call
+    prior_input = state.get("input_tokens", 0)
+    prior_output = state.get("output_tokens", 0)
+    total_input = prior_input + gen_pt
+    total_output = prior_output + gen_ct
+
+    retrieve_ms = (
+        all_latencies.get("retrieve_vector")
+        or all_latencies.get("retrieve_cag")
+        or all_latencies.get("retrieve_graph")
+        or 0
+    )
+
+    metrics = {
+        "total_latency_ms": sum(v for v in all_latencies.values()),
+        "retrieve_latency_ms": retrieve_ms,
+        "rerank_latency_ms": 0,  # included in retrieve
+        "graph_latency_ms": all_latencies.get("retrieve_graph", 0),
+        "generate_latency_ms": gen_latency_ms,
+        "validate_latency_ms": all_latencies.get("validate_numbers", 0),
+        "model": cfg.DEFAULT_LLM_MODEL,
+        "input_tokens": total_input,
+        "output_tokens": total_output,
+        "estimated_cost_usd": round(cfg.estimate_cost(total_input, total_output), 6),
+        "chunk_count": len(state.get("retrieved_chunks", [])),
+        "citation_count": len(citations),
+        "step_latencies": all_latencies,
+    }
 
     new_turn = ConversationTurn(
         question=state["question"],
         rewritten_query=state.get("rewritten_query"),
-        retrieved_chunks=context_chunks,
+        retrieved_chunks=state.get("retrieved_chunks", []),
     )
 
     return {
         "answer": answer,
         "citations": citations,
-        "conversation_history": [new_turn],  # additive — appended by reducer
+        "retrieved_chunks": state.get("retrieved_chunks", []),
+        "conversation_history": [new_turn],
+        "metrics": metrics,
+        "step_latencies": {"generate": gen_latency_ms},
+        **_tok(gen_pt, gen_ct),
     }
 
 
 def _comparison_retrieval(
     query: str, collection: str, scopes: list[str]
 ) -> list[ChunkResult]:
-    """
-    Decompose a comparison query into sub-queries and retrieve each fresh.
-
-    Returns combined, deduplicated chunks from both sub-retrievals.
-    """
-    decompose_prompt = (
-        f"Decompose this comparison question into exactly 2 simple sub-questions, "
-        f"one for each subject being compared. Return only the 2 questions, one per line.\n\n"
-        f"Question: {query}"
-    )
+    """Decompose comparison query → retrieve each subject fresh."""
     raw = _chat(
-        [{"role": "user", "content": decompose_prompt}],
+        [{"role": "user", "content": (
+            f"Decompose this comparison question into exactly 2 simple sub-questions, "
+            f"one for each subject. Return only 2 questions, one per line.\n\nQuestion: {query}"
+        )}],
         max_tokens=150,
     )
     sub_queries = [q.strip().lstrip("12.-) ") for q in raw.strip().splitlines() if q.strip()][:2]
-
     if len(sub_queries) < 2:
-        # Decomposition failed — fall back to single retrieval
         sub_queries = [query]
 
     all_chunks: list[ChunkResult] = []
     seen: set[str] = set()
     for sq in sub_queries:
-        candidates = hybrid_search(sq, collection, scopes, top_k=10)
-        fresh = rerank(sq, candidates, top_n=3)
+        fresh = _retrieve_for_facet(sq, collection, scopes, top_n=5)
         for c in fresh:
             if c.chunk_id not in seen:
                 seen.add(c.chunk_id)
                 all_chunks.append(c)
-
     return all_chunks

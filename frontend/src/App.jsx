@@ -1,21 +1,29 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Brain, Activity, ChevronRight, Wifi, WifiOff, RefreshCw } from 'lucide-react'
+import { Brain, Activity, Wifi, WifiOff, RefreshCw, Shuffle, ShieldCheck } from 'lucide-react'
 import clsx from 'clsx'
 import { healthCheck } from './api/client.js'
 import DocumentLibrary from './components/DocumentLibrary.jsx'
 import ChatPanel from './components/ChatPanel.jsx'
 import LiveTrace from './components/LiveTrace.jsx'
 
-const COLLECTIONS = ['demo', 'finance', 'legal', 'general']
+const COLLECTIONS = ['sec-filings', 'legal-docs']
+
+const ROLES = [
+  { value: 'general', label: 'General', color: 'text-slate-400 bg-slate-700/40 border-slate-600/40' },
+  { value: 'finance', label: 'Finance', color: 'text-blue-400 bg-blue-500/10 border-blue-500/20' },
+  { value: 'legal',   label: 'Legal',   color: 'text-purple-400 bg-purple-500/10 border-purple-500/20' },
+  { value: 'admin',   label: 'Admin',   color: 'text-amber-400 bg-amber-500/10 border-amber-500/20' },
+]
 
 export default function App() {
-  const [collection, setCollection] = useState('demo')
+  // libraryCollection drives the document browser only; chat always uses 'auto'
+  const [libraryCollection, setLibraryCollection] = useState('sec-filings')
   const [showTrace, setShowTrace] = useState(true)
   const [traceEvents, setTraceEvents] = useState([])
   const [isStreaming, setIsStreaming] = useState(false)
   const [backendOk, setBackendOk] = useState(null)
+  const [role, setRole] = useState('general')
 
-  // Backend health check
   useEffect(() => {
     let alive = true
     const check = async () => {
@@ -43,7 +51,7 @@ export default function App() {
   }, [])
 
   return (
-    <div className="flex flex-col h-screen bg-surface-900 overflow-hidden">
+    <div className="flex flex-col h-screen bg-surface-950 overflow-hidden">
       {/* ── Top bar ─────────────────────────────────────────────────── */}
       <header className="flex items-center justify-between px-4 h-12 border-b border-white/5 bg-surface-950/80 backdrop-blur-sm flex-shrink-0">
         <div className="flex items-center gap-3">
@@ -54,22 +62,31 @@ export default function App() {
             <span className="font-semibold text-sm text-slate-100">Agentic RAG</span>
           </div>
 
-          <ChevronRight className="w-3.5 h-3.5 text-slate-600" />
-
-          {/* Collection selector */}
-          <select
-            value={collection}
-            onChange={e => setCollection(e.target.value)}
-            className="bg-surface-800 border border-white/10 rounded-md px-2.5 py-1 text-xs text-slate-300 focus:outline-none focus:ring-1 focus:ring-brand-500 cursor-pointer"
-          >
-            {COLLECTIONS.map(c => (
-              <option key={c} value={c}>{c}</option>
-            ))}
-          </select>
+          {/* Auto-routing badge — replaces the manual collection selector */}
+          <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/20 text-[11px] text-amber-400 font-medium">
+            <Shuffle className="w-3 h-3" />
+            scoped to: auto
+          </span>
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Backend status */}
+          {/* Role picker */}
+          <div className="flex items-center gap-1 p-0.5 rounded-lg bg-surface-900 border border-white/5">
+            <ShieldCheck className="w-3 h-3 text-slate-600 ml-1.5 flex-shrink-0" />
+            {ROLES.map(r => (
+              <button
+                key={r.value}
+                onClick={() => setRole(r.value)}
+                className={clsx(
+                  'px-2 py-0.5 rounded-md text-[10px] font-medium border transition-all',
+                  role === r.value ? r.color : 'text-slate-600 bg-transparent border-transparent hover:text-slate-400',
+                )}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
+
           {backendOk === null ? (
             <span className="badge bg-slate-700/60 text-slate-400">
               <RefreshCw className="w-3 h-3 animate-spin mr-1" /> checking
@@ -84,7 +101,6 @@ export default function App() {
             </span>
           )}
 
-          {/* Trace toggle */}
           <button
             onClick={() => setShowTrace(v => !v)}
             className={clsx(
@@ -100,19 +116,20 @@ export default function App() {
 
       {/* ── Main layout ─────────────────────────────────────────────── */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Left: Document library */}
-        <aside className="w-64 flex-shrink-0 flex flex-col border-r border-white/5 bg-surface-900">
+        {/* Left: Document library — has its own collection switcher */}
+        <aside className="w-64 flex-shrink-0 flex flex-col border-r border-white/5 bg-surface-950">
           <DocumentLibrary
-            collection={collection}
-            onCollectionChange={setCollection}
+            collection={libraryCollection}
+            onCollectionChange={setLibraryCollection}
             collections={COLLECTIONS}
           />
         </aside>
 
-        {/* Center: Chat */}
+        {/* Center: Chat — always uses auto-routing */}
         <main className="flex-1 flex flex-col overflow-hidden min-w-0">
           <ChatPanel
-            collection={collection}
+            collection="auto"
+            role={role}
             onTraceEvent={handleTraceEvent}
             onQueryStart={handleQueryStart}
             onQueryEnd={handleQueryEnd}
@@ -122,7 +139,7 @@ export default function App() {
 
         {/* Right: Live Trace (collapsible) */}
         {showTrace && (
-          <aside className="w-80 flex-shrink-0 flex flex-col border-l border-white/5 bg-surface-900 animate-fade-in">
+          <aside className="w-80 flex-shrink-0 flex flex-col border-l border-white/5 bg-surface-950 animate-fade-in">
             <LiveTrace events={traceEvents} isStreaming={isStreaming} />
           </aside>
         )}

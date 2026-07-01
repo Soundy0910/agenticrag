@@ -44,6 +44,14 @@ from backend.ingest.parse import ParsedDocument
 from backend.storage.base import DocumentMetadata
 
 
+def _lazy_detect_section_type(text: str, collection: str, filename: str) -> str:
+    try:
+        from backend.ingest.section_detect import detect_section_type
+        return detect_section_type(text, collection, filename)
+    except Exception:
+        return "general"
+
+
 # ---------------------------------------------------------------------------
 # Configuration (eval-tunable, never hard-coded)
 # ---------------------------------------------------------------------------
@@ -136,6 +144,7 @@ class Chunk:
     file_type: str
     embedding_model: str
     access_scope: list[str]
+    section_type: str = "general"
     extra: dict = field(default_factory=dict)
 
 
@@ -444,6 +453,12 @@ def chunk_document(
     for p_idx, parent_text in enumerate(parent_texts):
         parent_id = _make_chunk_id(metadata.doc_id, p_idx)
 
+        # Detect section type from parent text — propagated to all children
+        # so every child chunk carries the same section_type as its parent.
+        section_type = _lazy_detect_section_type(
+            parent_text, metadata.collection, metadata.filename
+        )
+
         parent_chunk = Chunk(
             chunk_id=parent_id,
             parent_id=None,
@@ -456,6 +471,7 @@ def chunk_document(
             file_type=metadata.file_type,
             embedding_model=metadata.embedding_model,
             access_scope=metadata.access_scope,
+            section_type=section_type,
             extra={**metadata.extra, "parent_index": p_idx},
         )
         chunks.append(parent_chunk)
@@ -474,6 +490,7 @@ def chunk_document(
                 file_type=metadata.file_type,
                 embedding_model=metadata.embedding_model,
                 access_scope=metadata.access_scope,
+                section_type=section_type,
                 extra={**metadata.extra, "parent_index": p_idx, "child_index": c_idx},
             )
             chunks.append(child_chunk)

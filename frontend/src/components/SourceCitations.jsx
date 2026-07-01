@@ -1,6 +1,16 @@
 import { useState } from 'react'
-import { BookOpen, ChevronDown, ChevronUp } from 'lucide-react'
+import { BookOpen, ChevronDown, ChevronUp, Building2, FileText, Calendar } from 'lucide-react'
 import clsx from 'clsx'
+
+function CitationBadge({ icon: Icon, text, className }) {
+  if (!text) return null
+  return (
+    <span className={clsx('inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-medium border', className)}>
+      {Icon && <Icon className="w-2.5 h-2.5" />}
+      {text}
+    </span>
+  )
+}
 
 export default function SourceCitations({ citations = [] }) {
   const [expanded, setExpanded] = useState(false)
@@ -17,24 +27,58 @@ export default function SourceCitations({ citations = [] }) {
       </div>
 
       <div className="space-y-1">
-        {visible.map((c, i) => (
-          <div
-            key={c.chunk_id ?? i}
-            className="px-2.5 py-2 rounded-md bg-surface-800 border border-white/5"
-          >
-            <div className="flex items-center justify-between gap-2 mb-0.5">
-              <span className="text-[11px] font-mono font-medium text-slate-400 truncate" title={c.filename}>
-                {c.filename}
-              </span>
-              <span className="badge bg-brand-500/10 text-brand-400 text-[10px] font-mono flex-shrink-0">
-                [{i + 1}]
-              </span>
+        {visible.map((c, i) => {
+          const title = c.display_name || c.filename || `Source ${i + 1}`
+          return (
+            <div
+              key={c.chunk_id ?? i}
+              className="px-2.5 py-2 rounded-md bg-surface-800 border border-white/5"
+            >
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <span
+                  className="text-[11px] font-medium text-blue-300 truncate leading-snug"
+                  title={c.filename}
+                >
+                  {title}
+                </span>
+                <span className="badge bg-blue-500/10 text-blue-400 text-[10px] font-mono flex-shrink-0">
+                  [{i + 1}]
+                </span>
+              </div>
+
+              {/* Metadata badges */}
+              {(c.company || c.filing_type || c.fiscal_year) && (
+                <div className="flex items-center flex-wrap gap-1 mb-1">
+                  {c.company && (
+                    <CitationBadge
+                      icon={Building2}
+                      text={c.company}
+                      className="bg-slate-700/60 text-slate-300 border-slate-600/40"
+                    />
+                  )}
+                  {c.filing_type && (
+                    <CitationBadge
+                      icon={FileText}
+                      text={c.filing_type}
+                      className="bg-blue-500/10 text-blue-400 border-blue-500/20"
+                    />
+                  )}
+                  {c.fiscal_year && (
+                    <CitationBadge
+                      icon={Calendar}
+                      text={c.fiscal_year}
+                      className="bg-amber-500/10 text-amber-400 border-amber-500/20"
+                    />
+                  )}
+                </div>
+              )}
+
+              <p className="text-[11px] font-mono text-slate-500 leading-relaxed line-clamp-2">
+                {c.preview ?? c.source_text?.slice(0, 160)}
+              </p>
             </div>
-            <p className="text-[11px] font-mono text-slate-500 leading-relaxed line-clamp-2">
-              {c.preview}
-            </p>
-          </div>
-        ))}
+          )
+        })}
       </div>
 
       {citations.length > 2 && (

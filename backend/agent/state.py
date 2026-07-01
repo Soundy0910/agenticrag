@@ -3,25 +3,15 @@ backend/agent/state.py
 
 LangGraph agent state — the shared object passed between every node in the graph.
 
-ARCHITECTURE CONSTRAINT (from ARCHITECTURE.md, section 5.9 and 5.10):
-  State MUST carry:
-    - The user's questions (current + recent history) — for query rewriting.
-    - Retrieved source chunks (current + reusable from prior turns) — grounded facts.
-  State MUST NOT carry:
-    - Prior generated answers — using a past LLM generation as input to a new
-      generation launders hallucinations forward. If the first answer was wrong,
-      the second answer compounds the error. Source chunks are safe to reuse
-      because they come from the document store, not from model generation.
+ARCHITECTURE CONSTRAINT:
+  State MUST carry questions and retrieved source chunks for rewriting and grounding.
+  State MUST NOT carry prior generated answers (hallucination laundering risk).
 
 LANGGRAPH REDUCER SEMANTICS:
-  Fields annotated with `Annotated[list[X], operator.add]` are *additive*:
-  when a node returns a value for that field, LangGraph appends it to the
-  existing list rather than replacing it. This is used for:
-    - conversation_history: accumulates turns across the session.
-    - reusable_chunks: accumulates source chunks retrieved in prior turns so
-      the generate node can draw on them without re-fetching.
-  All other fields are last-write-wins: a node's returned value replaces the
-  current state value for that field.
+  - Annotated[list[X], operator.add]  → additive (append)
+  - Annotated[dict, _merge_dicts]     → merge (union)
+  - Annotated[int, operator.add]      → additive (sum)
+  - All other fields                  → last-write-wins
 """
 
 import operator
@@ -34,6 +24,15 @@ from backend.retrieval.hybrid import ChunkResult
 
 
 # ---------------------------------------------------------------------------
+# Dict merge reducer — used for step_latencies so each node can add its key
+# without reading-then-writing the full dict.
+# ---------------------------------------------------------------------------
+
+def _merge_dicts(a: dict, b: dict) -> dict:
+    return {**a, **b}
+
+
+# ---------------------------------------------------------------------------
 # Supporting types
 # ---------------------------------------------------------------------------
 
@@ -42,38 +41,40 @@ class Citation:
     """
     One source reference attached to the generated answer.
 
-    The generate node populates citations so the UI can render
-    "Source: filename, page/section" links next to each claim.
-    source_text is stored verbatim so the UI can show the exact
-    passage without a second retrieval call.
+    Enhanced with structured metadata so the UI can render human-readable
+    labels like "Microsoft FY2025 Form 10-K" instead of raw filenames.
     """
     chunk_id: str
     doc_id: str
     filename: str
     collection: str
-    source_text: str       # verbatim chunk text — shown in the citation card
+    source_text: str       # verbatim chunk text — shown in citation card
+    # Enhanced metadata (populated by generate_node)
+    company: str = ""
+    filing_type: str = ""  # "10-K", "EX-10", "EX-10.7", etc.
+    fiscal_year: str = ""  # "FY2025", "FY2024", etc.
+    section: str = ""      # "Item 7", "Item 1A", "Exhibit 10.17", etc.
+    display_name: str = "" # "Microsoft FY2025 Form 10-K → Item 7"
+
+
+@dataclass
+class CollectionQuery:
+    """
+    One collection-scoped sub-question produced by decompose_node.
+    """
+    collection: str
+    sub_question: str
 
 
 @dataclass
 class ConversationTurn:
     """
-    One complete Q&A turn, stored in history for query rewriting.
-
-    WHY NO `answer` FIELD:
-      The rewrite node needs to know what the user asked before so it can
-      resolve pronouns and follow-ups ("tell me more about that").  It reads
-      prior *questions* to produce a standalone rewrite. It does NOT need
-      prior generated answers — and storing answers here would risk the rewrite
-      node treating a past hallucination as factual context.
-
-    retrieved_chunks carries the source passages from this turn. These ARE
-    safe to surface in later turns because they are direct document quotes,
-    not model-generated text.
+    One complete Q&A turn stored in history for query rewriting.
+    No answer field — see architecture constraint above.
     """
-    question: str                        # original user question this turn
-    rewritten_query: str | None          # standalone rewrite (None for turn 1)
-    retrieved_chunks: list[ChunkResult]  # source passages retrieved this turn
-    # NOTE: no `answer` field — see module docstring
+    question: str
+    rewritten_query: str | None
+    retrieved_chunks: list[ChunkResult]
 
 
 # ---------------------------------------------------------------------------
@@ -84,132 +85,175 @@ class AgentState(MessagesState):
     """
     Shared state object threaded through every LangGraph node.
 
-    MessagesState base adds a `messages` field (Annotated list with add_messages
-    reducer) for the conversation message history. We extend it with all the
-    fields the RAG agent needs.
-
     Node responsibilities:
-      rewrite_node   → writes rewritten_query
-      router_node    → writes collection, route
-      retrieve_node  → writes retrieved_chunks; appends to reusable_chunks
-      grade_node     → writes grade, retry_count
-      generate_node  → writes answer, citations
-      (all nodes)    → read question, collection, allowed_scopes
+      rewrite_node        → writes rewritten_query
+      classify_node       → writes query_classification
+      router_node         → writes collection, route, active_collections
+      access_check_node   → writes access_denied, access_denial_reason
+      decompose_node      → writes collection_queries
+      retrieve_*_node     → writes retrieved_chunks; appends reusable_chunks
+      grade_node          → writes grade, facet_grades, answerability, conflict_detected
+      validate_numbers_node → writes numeric_validation
+      generate_node       → writes answer, citations
+      (all nodes)         → update step_latencies, total_tokens
     """
 
-    # ---- Input (set at conversation start, not modified by nodes) ----------
+    # ── Input ────────────────────────────────────────────────────────────────
 
     question: str
-    """The user's current raw question, as typed."""
+    """The user's current raw question."""
 
     collection: str
-    """
-    Pinecone namespace to search. Set by the caller before invoking the graph,
-    or overridden by the router node if it detects a collection mismatch.
-    """
+    """Pinecone namespace to search."""
 
     allowed_scopes: list[str]
+    """Access identifiers for the requesting user/role."""
+
+    user_role: str
     """
-    Access identifiers for the requesting user/role. Passed to hybrid_search()
-    to filter out chunks the user is not permitted to see.
-    E.g. ['public'] for unauthenticated access, ['user-123', 'team-a'] for
-    a logged-in user.
+    Role of the requesting user: 'admin' | 'finance' | 'legal' | 'general'.
+    Controls which collections the user may access (enforced by access_check_node).
     """
 
-    # ---- Rewrite node output -----------------------------------------------
+    # ── Rewrite node ─────────────────────────────────────────────────────────
 
     rewritten_query: str
+    """Standalone, self-contained version of the question for retrieval."""
+
+    # ── Query classification ─────────────────────────────────────────────────
+
+    query_classification: dict
     """
-    The standalone, self-contained version of `question` produced by the
-    rewrite node. Follow-up questions like "What about their liabilities?"
-    become "What are Company X's total liabilities in FY2023?" — fully
-    resolvable without the prior conversation. This is what retrieval uses.
+    Structured output from classify_node. Keys:
+      query_type: str  — one of:
+        factual_lookup | comparison | trend_analysis | calculation |
+        risk_analysis | multi_document_reasoning | summarization |
+        out_of_scope | unclear
+      requires_calculation: bool
+      requires_multi_doc: bool
+      requires_graph: bool
+      expected_output_format: str  — short_answer_with_citation |
+        comparison_table | trend_summary | calculated_result |
+        risk_bullet_list | multi_part_answer | clarification_needed
+      reason: str
     """
 
-    # ---- Collection routing ------------------------------------------------
+    # ── Access control ────────────────────────────────────────────────────────
+
+    access_denied: bool
+    """True if access_check_node blocked the query due to role restrictions."""
+
+    access_denial_reason: str
+    """Human-readable explanation of access denial."""
+
+    # ── Collection routing ────────────────────────────────────────────────────
 
     active_collections: list[str]
-    """
-    The collection(s) to search this turn. Set by the router when collection
-    is 'auto' (cross-collection mode) or explicitly by the caller.
-    Single entry → standard path. Two entries → parallel search + RRF merge.
-    Always contains at least [collection] as a fallback.
-    """
+    """Collection(s) to search this turn."""
 
-    # ---- Router node output ------------------------------------------------
+    collection_queries: list[CollectionQuery]
+    """Per-collection sub-questions from decompose_node."""
 
     route: str
-    """
-    Retrieval path chosen by the router node.
-    One of: 'vector' | 'graph' | 'cag'
-      vector — standard hybrid search (default for factual lookups)
-      graph  — Neo4j graph retrieval (relational/comparative questions)
-      cag    — context-stuffing (entire document set fits in context window)
-    """
+    """Retrieval path: 'vector' | 'graph' | 'cag'"""
 
-    # ---- Retrieval ---------------------------------------------------------
+    # ── Retrieval ────────────────────────────────────────────────────────────
 
     retrieved_chunks: list[ChunkResult]
-    """
-    Chunks retrieved in the CURRENT turn by the retrieve node.
-    Replaced on every retrieve call (not additive). The grade node reads
-    these to decide if retrieval was sufficient.
-    """
+    """Chunks retrieved in the current turn."""
 
     reusable_chunks: Annotated[list[ChunkResult], operator.add]
-    """
-    Source chunks accumulated across ALL prior turns in this session.
+    """Source chunks accumulated across all prior turns."""
 
-    WHY REUSE CHUNKS (not re-retrieve):
-      If the user asks two questions about the same section of a document,
-      re-retrieval costs latency + embedding API calls. The chunks already
-      fetched are source-grounded and safe to carry forward.
-
-    WHY NOT REUSE ANSWERS:
-      If the generate node produced an answer and it was subtly wrong, carrying
-      that answer into the next turn's context would compound the error. Chunks
-      are direct document quotes — reusing them is safe.
-
-    Annotated with operator.add so each retrieve call appends new chunks
-    rather than replacing prior turns' chunks.
-    """
-
-    # ---- Grade node output -------------------------------------------------
+    # ── Grade node ────────────────────────────────────────────────────────────
 
     grade: str
-    """
-    Retrieval quality decision from the grade node.
-    'sufficient'   → proceed to generate
-    'insufficient' → retry with a reformulated query (the self-correction loop)
-    """
+    """'sufficient' | 'insufficient'"""
+
+    facet_grades: list[dict]
+    """Per-collection grade results for multi-collection queries."""
 
     retry_count: int
+    """How many grade→retrieve retry loops have run this turn."""
+
+    answerability: str
     """
-    How many grade→retrieve retry loops have run this turn. The graph's
-    conditional edge caps this (typically at 2) to prevent infinite loops
-    when the corpus genuinely doesn't contain the answer.
+    'sufficient' | 'insufficient' | 'conflicting'
+    More detailed than grade — surfaced in UI trace and done event.
     """
 
-    # ---- Conversation history ----------------------------------------------
+    answerability_reason: str
+    """Why the context is insufficient or conflicting."""
+
+    missing_info: list[str]
+    """Specific information absent from retrieved context."""
+
+    conflict_detected: bool
+    """
+    True when retrieved chunks contain conflicting values for the same
+    metric/period (e.g., two different revenue figures for FY2024).
+    """
+
+    # ── Numeric validation ────────────────────────────────────────────────────
+
+    numeric_validation: dict
+    """
+    Populated by validate_numbers_node for calculation queries. Structure:
+    {
+      "metric": str,
+      "company": str,
+      "periods": [{"year": int, "value": float, "unit": str, "source_id": str}],
+      "calculation": {"absolute_change": float, "percentage_change": float, "formula": str}
+    }
+    Empty dict when validation was not triggered or not needed.
+    """
+
+    # ── Conversation history ─────────────────────────────────────────────────
 
     conversation_history: Annotated[list[ConversationTurn], operator.add]
-    """
-    Recent turns (question + retrieved chunks) accumulated across the session.
-    The rewrite node reads the last N entries to resolve pronouns and
-    follow-ups. Annotated with operator.add so each completed turn appends.
+    """Recent Q&A turns for follow-up rewriting."""
 
-    Only questions and retrieved chunks are stored here — see ConversationTurn
-    for the explicit design note on why generated answers are excluded.
-    """
-
-    # ---- Generate node output ----------------------------------------------
+    # ── Generate node ─────────────────────────────────────────────────────────
 
     answer: str
-    """The generated answer, grounded in retrieved_chunks + reusable_chunks."""
+    """The generated answer, grounded in retrieved source chunks."""
 
     citations: list[Citation]
+    """Source references with structured metadata for the UI."""
+
+    # ── Performance tracking ─────────────────────────────────────────────────
+
+    total_tokens: Annotated[int, operator.add]
+    """Cumulative LLM token count across all nodes (prompt + completion)."""
+
+    input_tokens: Annotated[int, operator.add]
+    """Cumulative prompt/input tokens across all nodes."""
+
+    output_tokens: Annotated[int, operator.add]
+    """Cumulative completion/output tokens across all nodes."""
+
+    step_latencies: Annotated[dict, _merge_dicts]
     """
-    Source references for the answer. The generate node populates one Citation
-    per source chunk it drew on. The API layer serialises these for the UI's
-    SourceCitations panel and the LiveTrace transparency view.
+    Per-node latency in milliseconds.
+    Each node returns {"step_latencies": {"node_name": ms}} and the
+    _merge_dicts reducer accumulates them so no node overwrites another's time.
+    Example: {"rewrite": 45, "classify": 120, "retrieve_vector": 830}
+    """
+
+    metrics: dict
+    """
+    Final aggregated metrics written by generate_node:
+    {
+      "total_latency_ms": int,
+      "retrieve_latency_ms": int,
+      "rerank_latency_ms": int,
+      "generate_latency_ms": int,
+      "graph_latency_ms": int,
+      "model": str,
+      "input_tokens": int,
+      "output_tokens": int,
+      "estimated_cost_usd": float,
+      "chunk_count": int,
+      "citation_count": int
+    }
     """

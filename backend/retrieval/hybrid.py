@@ -161,6 +161,10 @@ def _build_bm25_index(collection: str) -> tuple[BM25Okapi, list[_CorpusEntry]]:
         return _bm25_cache[collection]
 
     # Fetch in batches (Pinecone fetch limit: 1000 IDs per request).
+    # Only index child chunks (is_parent=False) so the BM25 corpus matches the
+    # set of chunks that vector search actually retrieves. Including parent chunks
+    # would double-count text (parents contain the same content as their children)
+    # which inflates document frequency, deflates IDF, and collapses BM25 scores.
     corpus: list[_CorpusEntry] = []
     batch_size = 200
     for i in range(0, len(all_ids), batch_size):
@@ -168,6 +172,8 @@ def _build_bm25_index(collection: str) -> tuple[BM25Okapi, list[_CorpusEntry]]:
         response = index.fetch(ids=batch_ids, namespace=collection)
         for vid, vec in response.vectors.items():
             meta = vec.metadata or {}
+            if bool(meta.get("is_parent", False)):
+                continue  # skip parent chunks — they duplicate child text
             text = meta.get("source_text", "")
             corpus.append(_CorpusEntry(
                 chunk_id=vid,
@@ -202,6 +208,7 @@ def _vector_search(
     collection: str,
     allowed_scopes: list[str],
     top_k: int,
+    section_filter: str | None = None,
 ) -> list[ChunkResult]:
     """
     Query Pinecone for the top-k most semantically similar chunks.
@@ -210,6 +217,11 @@ def _vector_search(
     whose access_scope list overlaps with allowed_scopes are returned. This is
     the permission-aware retrieval mechanism: the vector DB enforces it inline,
     no separate ACL lookup needed.
+
+    section_filter : str | None
+        When set (e.g. "income_statement", "risk_factors"), adds a Pinecone
+        metadata filter so only chunks with that section_type are returned.
+        This dramatically improves precision for section-specific queries.
     """
     model = cfg.get_embedding_model(collection)
     query_vector = embed_texts([query], model)[0]
@@ -220,6 +232,8 @@ def _vector_search(
     pinecone_filter: dict = {}
     if allowed_scopes:
         pinecone_filter["access_scope"] = {"$in": allowed_scopes}
+    if section_filter:
+        pinecone_filter["section_type"] = {"$eq": section_filter}
 
     response = index.query(
         vector=query_vector,
@@ -251,6 +265,7 @@ def _bm25_search(
     query: str,
     collection: str,
     top_k: int,
+    section_filter: str | None = None,
 ) -> list[ChunkResult]:
     """
     Score all chunks in the collection with BM25 and return the top-k.
@@ -260,13 +275,35 @@ def _bm25_search(
     vector search level and in the final fusion step if needed. For the demo
     all content is public; a production system would pre-filter the corpus by
     scope before building the BM25 index, or filter results post-scoring.
+
+    section_filter : str | None
+        When set, restricts BM25 scoring to corpus entries whose metadata
+        section_type matches. This keeps BM25 results consistent with the
+        section-filtered vector search results going into RRF fusion.
     """
     bm25, corpus = _build_bm25_index(collection)
     if not corpus:
         return []
 
+    # Narrow corpus to section type if requested
+    if section_filter:
+        filtered_corpus = [
+            e for e in corpus
+            if e.metadata.get("section_type", "general") == section_filter
+        ]
+        if filtered_corpus:
+            effective_corpus = filtered_corpus
+            effective_bm25 = BM25Okapi([e.tokens for e in effective_corpus])
+        else:
+            # No filtered entries yet (pre-backfill) — fall back to full corpus
+            effective_corpus = corpus
+            effective_bm25 = bm25
+    else:
+        effective_corpus = corpus
+        effective_bm25 = bm25
+
     query_tokens = _tokenize(query)
-    scores = bm25.get_scores(query_tokens)
+    scores = effective_bm25.get_scores(query_tokens)
 
     # Pair (score, corpus_index), sort descending, take top_k.
     ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
@@ -275,7 +312,7 @@ def _bm25_search(
     for rank, (idx, score) in enumerate(ranked, start=1):
         if score == 0.0:
             break  # no keyword overlap — remaining results are useless
-        entry = corpus[idx]
+        entry = effective_corpus[idx]
         m = entry.metadata
         results.append(ChunkResult(
             chunk_id=entry.chunk_id,
@@ -347,6 +384,7 @@ def hybrid_search(
     collection: str,
     allowed_scopes: list[str],
     top_k: int = 10,
+    section_filter: str | None = None,
 ) -> list[ChunkResult]:
     """
     Hybrid retrieval: vector + BM25 fused with RRF.
@@ -365,6 +403,13 @@ def hybrid_search(
         unauthenticated access.
     top_k : int
         Number of results to return after fusion.
+    section_filter : str | None
+        Optional section type to restrict retrieval to. One of:
+        "income_statement", "risk_factors", "mda", "business_overview",
+        "financial_notes", "legal_provision", "general".
+        When set, both vector search (Pinecone metadata filter) and BM25
+        (corpus subset) are scoped to that section type.
+        None → no section filtering (current behaviour).
 
     Returns
     -------
@@ -377,7 +422,7 @@ def hybrid_search(
     # material to work with. Standard practice: 3–5× the desired final count.
     candidate_k = max(top_k * 3, 20)
 
-    vector_results = _vector_search(query, collection, allowed_scopes, candidate_k)
-    bm25_results = _bm25_search(query, collection, candidate_k)
+    vector_results = _vector_search(query, collection, allowed_scopes, candidate_k, section_filter)
+    bm25_results = _bm25_search(query, collection, candidate_k, section_filter)
 
     return _rrf_fusion(vector_results, bm25_results, top_k)

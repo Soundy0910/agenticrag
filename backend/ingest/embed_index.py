@@ -184,6 +184,7 @@ def _chunk_to_vector(chunk: Chunk, vector: list[float]) -> dict:
             "access_scope": chunk.access_scope,
             "embedding_model": chunk.embedding_model,
             "is_parent": chunk.is_parent,
+            "section_type": chunk.section_type,
             "source_text": chunk.source_text,
         },
     }
