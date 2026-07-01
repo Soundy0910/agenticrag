@@ -142,7 +142,7 @@ function EmptyState({ onPickQuestion }) {
           </div>
           <div className="px-3 py-2 rounded-lg bg-surface-950 border border-blue-500/20">
             <p className="text-xs font-medium text-blue-300">legal-docs</p>
-            <p className="text-[11px] text-slate-500 mt-0.5">Material contracts (EX-10 exhibits) — MSFT supply agreements, JPM credit/license exhibits. <span className="text-amber-500">No Apple contracts yet.</span></p>
+            <p className="text-[11px] text-slate-500 mt-0.5">Material contracts (EX-10 exhibits) — MSFT officer indemnification agreements (EX-10.7, EX-10.8), JPM credit/license exhibits.</p>
           </div>
         </div>
 

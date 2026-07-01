@@ -692,6 +692,29 @@ def classify_node(state: AgentState) -> dict[str, Any]:
     t0 = time.time()
     query: str = state.get("rewritten_query") or state["question"]
 
+    # Fast pre-check: if query has zero domain signals, mark out_of_scope without LLM call
+    _DOMAIN_SIGNALS = [
+        "revenue", "income", "profit", "earnings", "fiscal", "annual", "10-k", "filing",
+        "risk", "agreement", "contract", "clause", "indemnif", "terminat", "exhibit",
+        "company", "corporation", "shares", "stock", "dividend", "margin", "ebitda",
+        "apple", "microsoft", "nvidia", "google", "amazon", "tesla", "jpmorgan",
+        "walmart", "disney", "pfizer", "exxon", "coca", "visa", "johnson",
+        "aapl", "msft", "nvda", "googl", "amzn", "tsla", "meta", "jpm",
+    ]
+    q_lower = query.lower()
+    has_domain_signal = any(sig in q_lower for sig in _DOMAIN_SIGNALS)
+    if not has_domain_signal:
+        oos = {
+            **_DEFAULT_CLASSIFICATION,
+            "query_type": "out_of_scope",
+            "expected_output_format": "refusal",
+            "reason": "Query contains no financial or legal document signals.",
+        }
+        return {
+            "query_classification": oos,
+            "step_latencies": {"classify": round((time.time() - t0) * 1000)},
+        }
+
     prompt = f"""Classify this document query. Return valid JSON only — no markdown, no explanation.
 
 Query: {query}
