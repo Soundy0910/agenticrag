@@ -30,6 +30,7 @@ SELF-HOSTED ALTERNATIVE (scale):
 
 import logging
 import os
+import time
 
 import backend.config as cfg
 from backend.retrieval.hybrid import ChunkResult
@@ -96,15 +97,29 @@ def rerank(
 
     top_n = min(top_n, len(candidates))
     client = _get_cohere()
-
     docs = [c.source_text for c in candidates]
 
-    response = client.rerank(
-        model=_COHERE_MODEL,
-        query=query,
-        documents=docs,
-        top_n=top_n,
-    )
+    # Retry with exponential backoff for Cohere trial-key rate limits (429).
+    max_attempts = 4
+    for attempt in range(max_attempts):
+        try:
+            response = client.rerank(
+                model=_COHERE_MODEL,
+                query=query,
+                documents=docs,
+                top_n=top_n,
+            )
+            break
+        except Exception as exc:
+            is_rate_limit = "429" in str(exc) or "TooManyRequests" in type(exc).__name__
+            if is_rate_limit and attempt < max_attempts - 1:
+                wait = 6 * (2 ** attempt)   # 6s, 12s, 24s
+                logger.warning("Cohere rate limit hit — retrying in %ds (attempt %d)", wait, attempt + 1)
+                time.sleep(wait)
+            else:
+                # Non-rate-limit error or out of retries — return candidates ranked by RRF score
+                logger.warning("rerank: Cohere failed (%s), falling back to hybrid ranking", exc)
+                return sorted(candidates, key=lambda c: c.score, reverse=True)[:top_n]
 
     reranked: list[ChunkResult] = []
     for result in response.results:

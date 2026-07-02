@@ -38,7 +38,7 @@ _JOBS: dict[str, dict] = {}
 # ---------------------------------------------------------------------------
 
 class TriggerRequest(BaseModel):
-    collection: str = "demo"
+    collection: str = "sec-filings"
     source_type: Literal["local", "azure"] = "azure"
     # For local source: path to the folder to watch
     local_path: str | None = None
@@ -81,7 +81,7 @@ def _run_ingest_job(job_id: str, request: TriggerRequest) -> None:
 
     try:
         source: DocumentSource = _build_source(request)
-        doc_metas = source.list_documents(collection=request.collection)
+        doc_metas = source.list_documents()
         if request.doc_ids:
             doc_metas = [m for m in doc_metas if m.doc_id in request.doc_ids]
 
@@ -122,8 +122,8 @@ def _build_source(request: TriggerRequest) -> DocumentSource:
     else:
         from backend.storage.azure_blob import AzureBlobSource
         return AzureBlobSource(
-            connection_string=cfg.AZURE_STORAGE_CONNECTION_STRING,
-            container=cfg.AZURE_STORAGE_CONTAINER,
+            collection=request.collection,
+            blob_prefix=f"{request.collection}/",
         )
 
 

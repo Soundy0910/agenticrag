@@ -10,7 +10,17 @@ import os
 from dotenv import load_dotenv
 from backend.ingest.chunk import ChunkConfig
 
-load_dotenv()  # reads .env from cwd (project root when run via scripts/)
+load_dotenv()  # try cwd first
+# fallback: look for .env in common locations relative to this file
+_here = os.path.dirname(os.path.abspath(__file__))
+for _candidate in [
+    os.path.join(_here, "storage", ".env"),
+    os.path.join(_here, ".env"),
+    os.path.join(_here, "..", ".env"),
+]:
+    if os.path.exists(_candidate):
+        load_dotenv(_candidate, override=False)
+        break
 
 
 # ---------------------------------------------------------------------------
@@ -99,22 +109,19 @@ ROLE_DESCRIPTIONS: dict[str, str] = {
 # LLM
 # ---------------------------------------------------------------------------
 
-DEFAULT_LLM_MODEL: str = "gpt-4o-mini"
+DEFAULT_LLM_MODEL: str = "gpt-4o"
 
 # Pricing per 1M tokens (as of mid-2025)
-GPT4O_MINI_INPUT_COST_PER_1M: float = 0.15    # $0.15 per 1M input tokens
-GPT4O_MINI_OUTPUT_COST_PER_1M: float = 0.60   # $0.60 per 1M output tokens
+_PRICING: dict[str, tuple[float, float]] = {
+    "gpt-4o-mini": (0.15, 0.60),    # input, output per 1M tokens
+    "gpt-4o":      (2.50, 10.00),
+}
 
 
 def estimate_cost(input_tokens: int, output_tokens: int, model: str = DEFAULT_LLM_MODEL) -> float:
     """Estimate USD cost for a given token usage."""
-    if model == "gpt-4o-mini":
-        return (
-            input_tokens * GPT4O_MINI_INPUT_COST_PER_1M / 1_000_000
-            + output_tokens * GPT4O_MINI_OUTPUT_COST_PER_1M / 1_000_000
-        )
-    # Fallback: blended rate
-    return (input_tokens + output_tokens) * 0.0002 / 1_000
+    input_rate, output_rate = _PRICING.get(model, (0.15, 0.60))
+    return (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
 
 
 # ---------------------------------------------------------------------------

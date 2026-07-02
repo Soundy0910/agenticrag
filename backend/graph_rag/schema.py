@@ -6,11 +6,11 @@ Config-driven graph schema definition.
 DESIGN: schema-pluggable
   extract.py and query.py consume a GraphSchema object — they never reference
   entity type names or relationship names as string literals. Swapping the
-  schema (e.g. finance → biomedical) requires only a new GraphSchema instance,
-  not changes to extraction or query logic.
+  schema requires only a new GraphSchema instance, not changes to extraction
+  or query logic.
 
-  The only built-in schema is FINANCE_SCHEMA, proven on SEC 10-K language.
-  Register additional schemas in SCHEMA_REGISTRY if new collections need them.
+New schema (v2) adds Filing, RiskFactor, Topic, and Chunk nodes so every
+graph fact links back to a source chunk for citation grounding.
 """
 
 from dataclasses import dataclass, field
@@ -23,29 +23,23 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class EntityType:
     """One node label in the graph."""
-    name: str                     # Neo4j label, e.g. "Company"
-    properties: list[str]         # expected property keys on this node
-    description: str              # for LLM extraction prompts
+    name: str
+    properties: list[str]
+    description: str
 
 
 @dataclass(frozen=True)
 class RelationshipType:
     """One directed edge type in the graph."""
-    name: str                     # Neo4j relationship type, e.g. "REPORTED"
-    from_entity: str              # label of the source node
-    to_entity: str                # label of the target node
+    name: str
+    from_entity: str
+    to_entity: str
     properties: list[str] = field(default_factory=list)
 
 
 @dataclass
 class GraphSchema:
-    """
-    Complete graph schema: entity types + relationship types.
-
-    Consumed by:
-      extract.py  — builds LLM prompt from entity/relationship descriptions
-      query.py    — builds Cypher node labels and relationship names
-    """
+    """Complete graph schema: entity types + relationship types."""
     name: str
     entities: list[EntityType]
     relationships: list[RelationshipType]
@@ -82,7 +76,7 @@ class GraphSchema:
 
 
 # ---------------------------------------------------------------------------
-# Finance / SEC schema
+# Finance / SEC schema v2
 # ---------------------------------------------------------------------------
 
 FINANCE_SCHEMA = GraphSchema(
@@ -90,36 +84,52 @@ FINANCE_SCHEMA = GraphSchema(
     entities=[
         EntityType(
             name="Company",
-            properties=["name", "ticker", "sector"],
-            description="A public or private company (e.g. 'Apple Inc.', ticker 'AAPL')",
+            properties=["company_id", "name", "ticker"],
+            description="A public company (e.g. name='Microsoft', ticker='MSFT')",
+        ),
+        EntityType(
+            name="Filing",
+            properties=["filing_id", "filing_type", "fiscal_year", "filing_date", "source_file", "collection"],
+            description="An SEC filing (e.g. filing_type='10-K', fiscal_year=2024)",
+        ),
+        EntityType(
+            name="BusinessSegment",
+            properties=["segment_id", "name"],
+            description="A business segment within a company (e.g. 'Intelligent Cloud', 'Services')",
         ),
         EntityType(
             name="Metric",
-            properties=["name", "value", "unit"],
+            properties=["metric_id", "name", "value", "unit", "fiscal_year", "period"],
             description=(
                 "A financial metric with a numeric value "
-                "(e.g. name='Revenue', value=394.3, unit='billion USD')"
+                "(e.g. name='Revenue', value=105362, unit='millions USD', fiscal_year=2025)"
             ),
         ),
         EntityType(
-            name="FiscalYear",
-            properties=["year", "quarter"],
-            description=(
-                "A fiscal year or quarter "
-                "(e.g. year='2024', quarter='Q4' or quarter=null for full year)"
-            ),
+            name="RiskFactor",
+            properties=["risk_id", "title", "summary", "fiscal_year"],
+            description="A risk factor disclosed in a filing (e.g. 'AI infrastructure scaling risk')",
         ),
         EntityType(
-            name="Segment",
-            properties=["name", "description"],
-            description="A business segment or product division within a company",
+            name="Topic",
+            properties=["topic_id", "name"],
+            description="A risk or business topic (e.g. 'AI', 'Cybersecurity', 'Regulation')",
+        ),
+        EntityType(
+            name="Chunk",
+            properties=["chunk_id", "source_file", "collection", "section", "text_preview"],
+            description="A source text chunk from Pinecone — provides citation grounding for graph facts",
         ),
     ],
     relationships=[
-        RelationshipType("REPORTED",         "Company",    "Metric",     ["source_doc"]),
-        RelationshipType("IN_PERIOD",         "Metric",     "FiscalYear", []),
-        RelationshipType("HAS_SEGMENT",       "Company",    "Segment",    []),
-        RelationshipType("SEGMENT_REPORTED",  "Segment",    "Metric",     ["source_doc"]),
+        RelationshipType("FILED",            "Company",         "Filing",          []),
+        RelationshipType("HAS_SEGMENT",      "Filing",          "BusinessSegment", []),
+        RelationshipType("REPORTED_METRIC",  "BusinessSegment", "Metric",          ["source_doc"]),
+        RelationshipType("SUPPORTED_BY",     "Metric",          "Chunk",           []),
+        RelationshipType("HAS_RISK_FACTOR",  "Filing",          "RiskFactor",      []),
+        RelationshipType("RELATED_TO_TOPIC", "RiskFactor",      "Topic",           []),
+        RelationshipType("SUPPORTED_BY",     "RiskFactor",      "Chunk",           []),
+        RelationshipType("HAS_CHUNK",        "Filing",          "Chunk",           []),
     ],
 )
 
@@ -131,7 +141,7 @@ FINANCE_SCHEMA = GraphSchema(
 SCHEMA_REGISTRY: dict[str, GraphSchema] = {
     "finance":     FINANCE_SCHEMA,
     "sec_filings": FINANCE_SCHEMA,
-    # "biomedical": BIOMEDICAL_SCHEMA,  # add when needed
+    "sec-filings": FINANCE_SCHEMA,
 }
 
 

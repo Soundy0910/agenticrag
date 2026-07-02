@@ -200,6 +200,13 @@ def _node_event(node_name: str, state: dict) -> dict:
         }
         if has_facets:
             payload["facets"] = _facet_retrievals(state)
+        if node_name == "retrieve_graph":
+            graph_count = state.get("graph_chunk_count")
+            if graph_count is not None:
+                payload["graph_chunk_count"] = graph_count
+                payload["vector_chunk_count"] = len(chunks) - graph_count
+            payload["graph_query_type"] = state.get("graph_query_type", "lookup")
+            payload["unsupported_count"] = state.get("graph_unsupported_count", 0)
         return payload
 
     if node_name == "grade":

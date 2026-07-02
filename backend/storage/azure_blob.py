@@ -55,6 +55,7 @@ class AzureBlobSource(DocumentSource):
         access_scope: list[str] | None = None,
         embedding_model: str = "text-embedding-3-small",
         poll_interval_seconds: float = 60.0,
+        blob_prefix: str | None = None,
     ) -> None:
         """
         Parameters
@@ -93,6 +94,7 @@ class AzureBlobSource(DocumentSource):
         self.access_scope = access_scope if access_scope is not None else ["public"]
         self.embedding_model = embedding_model
         self.poll_interval = poll_interval_seconds
+        self.blob_prefix = blob_prefix  # when set, only blobs under this prefix are yielded
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -141,7 +143,7 @@ class AzureBlobSource(DocumentSource):
 
         Local equivalent: Path.rglob("*") iterated lazily.
         """
-        for props in self.client.list_blobs():
+        for props in self.client.list_blobs(name_starts_with=self.blob_prefix):
             if is_supported(props["name"]):
                 yield self._metadata_from_props(props)
 
@@ -200,7 +202,7 @@ class AzureBlobSource(DocumentSource):
 
         while True:
             time.sleep(self.poll_interval)
-            for props in self.client.list_blobs():
+            for props in self.client.list_blobs(name_starts_with=self.blob_prefix):
                 name: str = props["name"]
                 if not is_supported(name):
                     continue

@@ -84,6 +84,9 @@ export default function UploadDropzone({ collection, onUploaded }) {
           {dragging ? 'Drop to upload' : 'Drop files or click'}
         </p>
         <p className="text-[10px] text-slate-600 mt-0.5">{ACCEPTED_LABELS.join(' · ')}</p>
+        <p className="text-[10px] text-blue-400/80 mt-1.5 font-medium">
+          Uploading to: <span className="text-blue-300">{collection}</span>
+        </p>
       </div>
 
       {/* Upload queue */}

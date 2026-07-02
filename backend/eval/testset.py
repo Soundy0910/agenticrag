@@ -1,7 +1,7 @@
 """
 backend/eval/testset.py
 
-Static test cases for RAGAS evaluation of the demo corpus.
+Production test cases for RAGAS evaluation — sec-filings and legal-docs collections.
 
 Three categories:
   EVAL_CASES    — Q+A pairs for RAGAS scoring (faithfulness, relevance, precision, recall)
@@ -9,18 +9,14 @@ Three categories:
 
 EVAL_CASES types:
   factual       — single-hop factual lookup; answer is in the docs
+  multi_facet   — question spans both sec-filings and legal-docs
   comparison    — multi-entity comparison; generate_node decomposes into sub-queries
-  not_in_docs   — answer is genuinely absent; agent should say "I don't know" (groundedness test)
-
-Routing decisions to verify:
-  cag   — demo collection is small enough to fit in context window
-  vector — larger collection or non-comparison question on finance
-  graph  — finance/sec_filings collection + comparison keyword → Neo4j path
+  not_in_docs   — answer is genuinely absent; agent should say "I don't know"
 
 Ground-truth notes:
-  Factual answers are derived from the indexed demo documents (PDF resume + DOCX resume + TOTALSL.csv).
-  "not_in_docs" ground truths state absence explicitly — RAGAS context_recall will be near 0
-  for these, which is correct (the corpus genuinely lacks this information).
+  Derived from indexed 10-K filings and legal exhibits (data/filings/ and data/legal/).
+  Figures match the actual filed documents — verify against source if re-indexing.
+  "not_in_docs" ground truths state absence explicitly — context_recall near 0 is correct.
 """
 
 from dataclasses import dataclass, field
@@ -29,12 +25,12 @@ from dataclasses import dataclass, field
 @dataclass
 class EvalCase:
     id: str
-    type: str          # factual | comparison | not_in_docs
+    type: str          # factual | multi_facet | comparison | not_in_docs
     question: str
-    ground_truth: str  # reference answer for RAGAS context_recall / answer_relevance
-    collection: str = "demo"
+    ground_truth: str
+    collection: str = "auto"
     allowed_scopes: list[str] = field(default_factory=lambda: ["public"])
-    notes: str = ""    # human-readable rationale for this case
+    notes: str = ""
 
 
 @dataclass
@@ -42,7 +38,7 @@ class RoutingCase:
     id: str
     question: str
     collection: str
-    expected_route: str   # cag | vector | graph
+    expected_route: str   # vector | graph
     notes: str = ""
 
 
@@ -51,168 +47,208 @@ class RoutingCase:
 # ---------------------------------------------------------------------------
 
 EVAL_CASES: list[EvalCase] = [
-    # ── Factual ──────────────────────────────────────────────────────────────
+
+    # ── Factual: sec-filings ─────────────────────────────────────────────────
+
     EvalCase(
         id="E01",
         type="factual",
-        question="What AWS certifications does the candidate have?",
+        question="What was Microsoft's total revenue and net income in FY2025?",
         ground_truth=(
-            "The candidate holds three certifications: AWS Certified AI Practitioner, "
-            "AWS Certified Machine Learning - Specialty, and SnowPro Associate."
+            "Microsoft's total revenue in fiscal year 2025 was $281,724 million ($281.7 billion), "
+            "a 15% increase from FY2024 revenue of $245,122 million. "
+            "Net income was $101,832 million ($101.8 billion)."
         ),
-        notes="Directly stated in the Certifications section of both resume files.",
+        collection="auto",
+        notes=(
+            "Tests income statement retrieval for MSFT. "
+            "Failure mode: agent may confuse Microsoft Cloud revenue ($168.9B) "
+            "with total revenue — the SUMMARY RESULTS OF OPERATIONS chunk must be retrieved."
+        ),
     ),
+
     EvalCase(
         id="E02",
         type="factual",
-        question="What is the candidate's current job title and employer?",
+        question="What were Walmart's net sales and what are the main risk factors they identified?",
         ground_truth=(
-            "The candidate is currently a Product Development Intern on the Data Science Team "
-            "at AmplifAI Solutions Inc., a role that started in January 2026."
+            "Walmart's consolidated net sales for fiscal year 2026 were approximately $674 billion "
+            "(Walmart U.S. $483B + Walmart International $130B + Sam's Club $90B). "
+            "Key risk factors include macroeconomic conditions affecting consumer spending, "
+            "intense retail competition, supply chain disruptions, cybersecurity threats, "
+            "labor and wage pressures, and regulatory compliance across global markets."
         ),
-        notes="Most recent EXPERIENCE entry in the PDF resume.",
+        collection="auto",
+        notes=(
+            "Multi-facet question: net sales and risk factors are in separate document sections. "
+            "Both facets must be retrieved — the 8-chunk cap often misses risk factors "
+            "when net sales chunks dominate the top results."
+        ),
     ),
+
     EvalCase(
         id="E03",
         type="factual",
-        question="What GPA did the candidate achieve in their Master's degree?",
+        question="What was Apple's total net sales in fiscal year 2024?",
         ground_truth=(
-            "The candidate achieved a GPA of 3.85 in their Master of Science in Business Analytics "
-            "and AI at the University of Texas at Dallas."
+            "Apple's total net sales for fiscal year 2024 (ended September 28, 2024) "
+            "were $391.0 billion, compared to $383.3 billion in fiscal year 2023."
         ),
-        notes="EDUCATION section, MS entry.",
+        collection="auto",
+        notes=(
+            "Single-company factual lookup from AAPL 10-K. "
+            "Tests that income statement chunk is retrieved over MD&A narrative."
+        ),
     ),
+
     EvalCase(
         id="E04",
         type="factual",
-        question="What programming languages does the candidate know?",
+        question="What was JPMorgan Chase's total net revenue for fiscal year 2025?",
         ground_truth=(
-            "The candidate is proficient in Python, R, and SQL."
+            "JPMorgan Chase's total net revenue for fiscal year 2025 was approximately "
+            "$175 billion, reflecting strong performance across Consumer & Community Banking, "
+            "Commercial Banking, and Corporate & Investment Bank segments."
         ),
-        notes="Technical Skills section lists Python, R, SQL as core languages.",
+        collection="auto",
+        notes=(
+            "Tests retrieval of consolidated total revenue vs segment-level figures. "
+            "Failure mode: agent returns international segment revenue ($24B) instead of total."
+        ),
     ),
+
+    # ── Multi-facet: cross-collection ────────────────────────────────────────
+
     EvalCase(
         id="E05",
-        type="factual",
-        question="What cloud platforms and ML tools does the candidate have experience with?",
-        ground_truth=(
-            "The candidate has experience with AWS (SageMaker, Glue, Athena), Azure, and Databricks "
-            "as cloud platforms, and uses Scikit-learn, XGBoost, LangChain, RAG, Google ADK, and Neo4j "
-            "as ML/AI tools."
+        type="multi_facet",
+        question=(
+            "What was JPMorgan's total revenue in 2025, and what are the key recoupment "
+            "conditions in their executive compensation agreements?"
         ),
-        notes="Technical Skills section — cloud + AI/engineering tools subsections.",
+        ground_truth=(
+            "JPMorgan Chase's total net revenue for fiscal year 2025 was approximately $175 billion. "
+            "Key recoupment conditions in JPMorgan's executive compensation agreements include: "
+            "the Bonus Recoupment Policy applies to both cash incentive compensation and RSU/PSU awards; "
+            "recovery is triggered by financial restatement or regulatory findings; "
+            "employees must repay amounts as a lawful recovery under the award agreement."
+        ),
+        collection="auto",
+        notes=(
+            "Cross-collection: sec-filings for revenue, legal-docs for recoupment (exhibit 10.17 RSU). "
+            "Note: JPM credit agreement is NOT indexed — using recoupment from the RSU award agreement."
+        ),
     ),
+
+    # ── Comparison ───────────────────────────────────────────────────────────
+
     EvalCase(
         id="E06",
-        type="factual",
-        question="Describe the candidate's AWS purchase intent prediction project.",
+        type="comparison",
+        question="Compare Apple and Microsoft's revenue for fiscal year 2024",
         ground_truth=(
-            "The candidate architected an ETL pipeline using AWS Athena to aggregate 400M+ events into "
-            "90M session-level records, and deployed a real-time XGBoost endpoint on AWS SageMaker "
-            "achieving 96.5% AUC for sub-second live inference."
+            "Apple's total net sales for fiscal year 2024 were $391.0 billion. "
+            "Microsoft's total revenue for fiscal year 2024 was $245.1 billion. "
+            "Apple had higher total revenue than Microsoft in FY2024 by approximately $146 billion."
         ),
-        notes="PROJECTS section — Scalable Real Time Purchase Intent Prediction on AWS.",
+        collection="auto",
+        notes=(
+            "Comparison requiring fresh retrieval for both companies. "
+            "Tests that _comparison_retrieval fetches Apple AND Microsoft chunks independently. "
+            "Common failure: only MSFT chunks retrieved because Apple FY2024 is a prior-year "
+            "figure in their FY2025 10-K."
+        ),
     ),
-    # ── Comparison ───────────────────────────────────────────────────────────
+
+    # ── Legal-specific ────────────────────────────────────────────────────────
+
     EvalCase(
         id="E07",
-        type="comparison",
-        question=(
-            "Compare the candidate's responsibilities at AmplifAI Solutions vs WellKnown Textile Mills. "
-            "What were the key differences in their work?"
-        ),
+        type="factual",
+        question="What are the compensation clawback conditions in Tesla's executive agreements?",
         ground_truth=(
-            "At AmplifAI Solutions Inc. (2026–present) the candidate works as a Product Development Intern "
-            "building Python automation tools for Azure cloud operations and operating an AI-powered quality "
-            "assurance product. At WellKnown Textile Mills (2022–2024) they worked as an Applied Data Scientist "
-            "orchestrating production predictive pipelines for scheduling and engineering multivariate "
-            "time-series forecasting systems. The key difference is that AmplifAI is an AI/cloud software role "
-            "while WellKnown was a manufacturing analytics role."
+            "Tesla's executive agreements include clawback provisions that allow the company "
+            "to recover incentive compensation in cases of financial statement restatement, "
+            "fraud or intentional misconduct, or violation of company policies. "
+            "The clawback covers cash bonuses and equity awards granted within a specified lookback period."
         ),
-        notes="Comparison between two EXPERIENCE entries. Tests decomposition in generate_node.",
+        collection="auto",
+        notes=(
+            "Legal-docs only question — must route to legal-docs namespace. "
+            "Tests retrieval of Tesla EX-10 exhibits. "
+            "Failure mode: agent says 'no information' when clawback clauses are present in the file."
+        ),
     ),
-    # ── Not in docs (groundedness) ───────────────────────────────────────────
+
+    # ── Not-in-docs (groundedness) ────────────────────────────────────────────
+
     EvalCase(
         id="E08",
         type="not_in_docs",
-        question="What is the candidate's expected salary or compensation?",
+        question="What is Microsoft's projected revenue for fiscal year 2027?",
         ground_truth=(
-            "The documents do not contain any information about the candidate's salary expectation or compensation."
+            "The indexed documents (10-K filings through FY2025) do not contain forward revenue "
+            "projections for fiscal year 2027. The 10-K contains forward-looking statements "
+            "but does not provide specific revenue forecasts."
         ),
+        collection="auto",
         notes=(
-            "Groundedness test: agent must say 'I don't know' rather than hallucinate a number. "
-            "Expect high faithfulness (grounded in context = nothing) but low context_recall."
+            "Groundedness test: agent must not hallucinate future revenue figures. "
+            "Expect high faithfulness (grounded refusal) but low context_recall."
         ),
     ),
+
     EvalCase(
         id="E09",
         type="not_in_docs",
-        question="Does the candidate have a LinkedIn Premium subscription?",
+        question="What is Nvidia's market capitalization as of today?",
         ground_truth=(
-            "The documents do not mention whether the candidate has a LinkedIn Premium subscription."
+            "The indexed 10-K filings do not contain current market capitalization data. "
+            "Market cap is not reported in annual reports; only shares outstanding are disclosed."
         ),
-        notes="Groundedness test: obscure personal detail guaranteed not in any resume.",
-    ),
-    EvalCase(
-        id="E10",
-        type="not_in_docs",
-        question="What is the candidate's nationality or visa status?",
-        ground_truth=(
-            "The documents do not contain information about the candidate's nationality or visa status."
-        ),
+        collection="auto",
         notes=(
-            "Groundedness test: sensitive personal info typically omitted from resumes. "
-            "Agent must not guess or hallucinate."
+            "Groundedness test: real-time data that is never in static 10-K filings. "
+            "Agent must say it doesn't have this information."
         ),
     ),
 ]
 
 
 # ---------------------------------------------------------------------------
-# Routing cases — used to verify router path decisions (not RAGAS-scored)
+# Routing cases — verify router path decisions (not RAGAS-scored)
 # ---------------------------------------------------------------------------
 
 ROUTING_CASES: list[RoutingCase] = [
     RoutingCase(
         id="R01",
-        question="What AWS certifications does the candidate have?",
-        collection="demo",
+        question="What was Microsoft's total revenue and net income in FY2025?",
+        collection="auto",
         expected_route="vector",
-        notes=(
-            "demo namespace is small, but 'AWS' is detected as a named entity by _has_named_entity "
-            "(capital mid-sentence word, len>2). Entity-specific queries bypass CAG → vector path. "
-            "This prevents cross-section misattribution in the resume document."
-        ),
+        notes="Single-company factual on sec-filings → vector path.",
     ),
     RoutingCase(
         id="R02",
-        question="What is the candidate's GPA?",
-        collection="demo",
+        question="What are the termination events in JPMorgan's credit agreements?",
+        collection="auto",
         expected_route="vector",
-        notes=(
-            "'GPA' is detected as a named entity (all-caps, len>2, mid-sentence). "
-            "Entity-specific queries bypass CAG → vector path even on small collections."
-        ),
+        notes="Legal keyword → routes to legal-docs namespace via vector.",
     ),
     RoutingCase(
         id="R03",
-        question="Compare Apple and Microsoft revenue for fiscal year 2024",
-        collection="finance",
+        question="Compare Apple and Microsoft's revenue for fiscal year 2024",
+        collection="sec-filings",
         expected_route="graph",
         notes=(
-            "finance collection + 'compare' keyword → router should pick graph path. "
-            "Neo4j has the Apple/Microsoft data from the test_graph_rag run."
+            "sec-filings collection + 'compare' keyword → graph path. "
+            "Falls back to vector if graph has no Apple/MSFT nodes."
         ),
     ),
     RoutingCase(
         id="R04",
-        question="What was Apple's total revenue in 2024?",
-        collection="finance",
+        question="What was Walmart's total net sales in fiscal year 2025?",
+        collection="auto",
         expected_route="vector",
-        notes=(
-            "finance collection, single-company lookup, no comparison keyword → vector path. "
-            "Pinecone has no finance vectors so retrieve will return empty, but the routing "
-            "decision itself (vector) is what's being verified."
-        ),
+        notes="Single-company factual → vector on sec-filings.",
     ),
 ]

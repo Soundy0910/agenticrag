@@ -1,0 +1,27 @@
+.git
+.omc
+.pytest_cache
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Credentials — never bake into image
+.env
+.env.*
+backend/storage/.env
+
+# Frontend build artifacts and deps (rebuilt in Docker)
+frontend/node_modules/
+frontend/dist/
+
+# Raw corpus — too large, not needed in image
+data/
+
+*.log

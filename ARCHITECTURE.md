@@ -1,14 +1,14 @@
 # ARCHITECTURE.md — Agentic RAG Knowledge Platform
 
-> **Purpose of this document:** This is the design + reasoning reference for the project. It explains *what* we're building and *why* each decision was made. Read this to understand the system and to explain it in interviews. The companion `BUILD_PLAN.md` is the operational, file-by-file build checklist.
+> **Purpose of this document:** Design decisions and rationale — the *why* behind every component choice. Read this to understand the system architecture and the trade-offs made at each layer. The companion `BUILD_PLAN.md` covers setup, ingestion, and what's left to build.
 
 ---
 
 ## 1. What this project is
 
-A **domain-agnostic, dynamic, agentic RAG platform**. SEC filings (10-Ks) are the **demo dataset**, but the system is built to ingest documents on *any* topic. Documents arrive dynamically (new files are ingested automatically), are stored with rich metadata, and are queried by an agent that decides *how* to retrieve per question.
+A **domain-agnostic, agentic RAG platform**. SEC 10-K filings and legal exhibits are the demo corpus — financial documents are a hard, table-heavy, regulated stress test — but the ingestion pipeline, retrieval layer, and agent are domain-agnostic. Domain specialization lives in swappable config (embedding model per collection, GraphRAG schema per domain).
 
-**One-line positioning:** "A general-purpose agentic RAG platform, demonstrated on SEC filings because financial documents are a hard, regulated, table-heavy stress test. Ingestion, retrieval, and the agent layer are domain-agnostic; domain specialization lives in swappable config."
+**One-line positioning:** "A production-style agentic RAG platform on SEC filings. Ingestion, retrieval, and the agent are domain-agnostic; the finance corpus is chosen because it's the hardest stress test for a RAG system."
 
 ---
 
@@ -135,27 +135,17 @@ Live, streaming, node-level execution trace — shows **input → transformation
 
 ---
 
-## 8. Designed-but-deferred (talking points / post-MVP)
-- **Slack / Monday connectors:** interface + stubs now; one connector (Blob) built real. PM-app specifics: assemble streams into units, rich metadata, **permission scope** (agent constrained to user's data permissions), webhooks for freshness.
-- **OKF (Google Open Knowledge Format, v0.1, June 2026):** markdown+YAML curated-concept format for the *curated-knowledge* layer (complements raw-doc RAG, doesn't replace it). Conceptually close to the GraphRAG concept layer. **Post-MVP optional:** express curated financial concept definitions as a small OKF bundle the agent reads as authoritative definitions. Strong "I'm current" interview point. Not core (v0.1, unstable).
-- **Document updates/deletes:** metadata has `doc_id` to support update/delete of stale chunks.
-- **Cost/latency observability, prompt-injection-via-documents awareness, streaming token output, multi-user auth:** designed-for or named, not core-built.
-- **Compliance-crawler extension:** see §8.1 below.
+## 8. Post-MVP extensions
 
-### 8.1 Compliance-crawler extension (designed, not built)
+These are architecturally designed and ready to wire in — none require changes to the core agent graph or retrieval layer.
 
-**Idea:** an automated source-connector that crawls public regulatory sources (SEC EDGAR full-text search, EUR-Lex, UK FCA register, FINRA rulebooks) on a configurable schedule and feeds new filings directly into the existing ingest pipeline without human upload.
-
-**How it fits the current architecture:**
-1. A lightweight `backend/connectors/compliance_crawler.py` task (Celery beat or Azure Functions timer) polls each source via its public API or HTML scraper.
-2. Each discovered document is normalised to the same `{filename, bytes, collection, access_scope}` shape that `POST /api/documents/upload` already accepts — the crawler is just another producer of that interface.
-3. The crawler writes a `source_url`, `regulation_id`, and `effective_date` into the chunk metadata at ingest time; the router and grade node can surface these as citation context ("Source: SEC 10-K filing 2024-02-14").
-4. `access_scope` stays the existing mechanism — regulatory docs default to `"public"`; internal legal opinions can be scoped to `"legal-team"`.
-5. No changes to the agent graph, retrieval, or UI are needed — the `legal` collection simply fills with real documents instead of remaining a stub.
-
-**Why deferred:** crawler scheduling, dedup (same filing re-published with minor edits), and rate-limit / robots.txt compliance are operational concerns that add no new architectural insight for the demo. The ingest pipeline is already built to receive them; this is wiring, not design.
+- **Slack / Monday connectors:** `DocumentSource` interface and stubs exist in `storage/`. Real implementation needs webhook listeners, stream-to-document assembly, and per-message `access_scope` tagging. Azure Blob is the reference implementation to follow.
+- **Compliance crawler:** a scheduled connector (Celery beat or Azure Functions timer) that polls SEC EDGAR, EUR-Lex, or FINRA on a cron and feeds discovered filings into the existing `POST /api/documents/upload` interface. Deferred because dedup and rate-limit compliance add operational complexity without new architectural insight.
+- **Document updates/deletes:** `doc_id` metadata is already stored per chunk; a re-ingest or delete pass against Pinecone namespaces is the only remaining work.
+- **Streaming token output, multi-user auth, cost dashboard:** designed for but not wired — FastAPI SSE already streams node events; extending to token-level streaming is a one-node change in `generate_node`.
 
 ---
 
 ## 9. Scalability note (the Python question)
 RAG is **I/O-bound** (waiting on API calls), not CPU-bound — so Python's GIL isn't the bottleneck. Production-scalable via: async FastAPI, stateless service behind a load balancer (horizontal scaling), containerized (Docker), background workers (Celery/Azure Functions) for heavy ingestion separate from the query path. The heavy compute lives inside the model providers, not your process. (The AQA Python→.NET migration was organizational — team standardizing on a known stack — not Python failing to scale.)
+

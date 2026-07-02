@@ -23,6 +23,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 # Load .env before any backend imports so config.py reads the right values
 load_dotenv(pathlib.Path(__file__).parent / "storage" / ".env")
@@ -73,3 +74,12 @@ app.include_router(eval_router.router,      prefix="/api")
 @app.get("/healthz", tags=["ops"])
 async def healthz():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Frontend (served last so API routes take priority)
+# ---------------------------------------------------------------------------
+
+_dist = pathlib.Path(__file__).parent.parent / "frontend" / "dist"
+if _dist.exists():
+    app.mount("/", StaticFiles(directory=_dist, html=True), name="frontend")

@@ -51,7 +51,7 @@ class UploadResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 @router.get("", response_model=list[DocumentInfo])
-async def list_documents(collection: str = "demo"):
+async def list_documents(collection: str = "sec-filings"):
     """
     List all documents indexed in a Pinecone namespace (collection).
 
@@ -99,7 +99,7 @@ async def list_documents(collection: str = "demo"):
 @router.post("/upload", response_model=UploadResponse)
 async def upload_document(
     file: UploadFile = File(...),
-    collection: str = Form("demo"),
+    collection: str = Form("sec-filings"),
     access_scope: str = Form("public"),
 ):
     """
@@ -168,7 +168,7 @@ async def upload_document(
 # ---------------------------------------------------------------------------
 
 @router.delete("/{doc_id}")
-async def delete_document(doc_id: str, collection: str = "demo"):
+async def delete_document(doc_id: str, collection: str = "sec-filings"):
     """
     Delete all Pinecone vectors for a document from the given collection.
 

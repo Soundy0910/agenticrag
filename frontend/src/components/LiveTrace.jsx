@@ -263,9 +263,41 @@ function NodeDetail({ event }) {
         </div>
       )
 
+    case 'retrieve_graph':
+      if (event.facets?.length >= 2) return <FacetTree facets={event.facets} variant="retrieve" />
+      return (
+        <div className="mt-2 space-y-1.5">
+          <div className="flex items-center gap-2 flex-wrap">
+            {event.graph_query_type && (
+              <span className="badge bg-purple-500/10 text-purple-300 border-purple-500/20 text-[10px]">
+                {event.graph_query_type.replace(/_/g, ' ')}
+              </span>
+            )}
+            {event.graph_chunk_count != null && (
+              <span className="badge bg-green-500/10 text-green-300 border-green-500/20 text-[10px]">
+                {event.graph_chunk_count} graph fact{event.graph_chunk_count !== 1 ? 's' : ''}
+              </span>
+            )}
+            {event.vector_chunk_count != null && (
+              <span className="badge bg-blue-500/10 text-blue-300 border-blue-500/20 text-[10px]">
+                {event.vector_chunk_count} vector chunk{event.vector_chunk_count !== 1 ? 's' : ''}
+              </span>
+            )}
+            {event.unsupported_count > 0 && (
+              <span className="badge bg-amber-500/10 text-amber-400 border-amber-500/20 text-[10px]">
+                {event.unsupported_count} unsupported
+              </span>
+            )}
+            {event.graph_chunk_count == null && (
+              <p className="text-[10px] text-slate-600">{event.chunk_count ?? 0} chunks merged</p>
+            )}
+          </div>
+          {event.chunks?.length > 0 && <ChunkList chunks={event.chunks} limit={5} />}
+        </div>
+      )
+
     case 'retrieve_vector':
     case 'retrieve_cag':
-    case 'retrieve_graph':
       if (event.facets?.length >= 2) return <FacetTree facets={event.facets} variant="retrieve" />
       if (!event.chunks?.length) return <p className="mt-2 text-[11px] text-red-400">No chunks retrieved</p>
       return (
@@ -376,12 +408,17 @@ function getSummary(event) {
       return `${event.facet_count ?? event.facets?.length ?? 0} sub-question${(event.facet_count ?? 0) !== 1 ? 's' : ''} scoped to collections`
     case 'retrieve_vector':
     case 'retrieve_cag':
-    case 'retrieve_graph':
       if (event.facets?.length >= 2) {
         const total = event.facets.reduce((n, f) => n + (f.chunk_count ?? 0), 0)
         return `${total} chunks across ${event.facets.length} facets`
       }
       return `${event.chunk_count} chunk${event.chunk_count !== 1 ? 's' : ''} retrieved`
+    case 'retrieve_graph':
+      if (event.graph_chunk_count != null) {
+        const vCount = event.vector_chunk_count ?? 0
+        return `${event.graph_chunk_count} graph fact${event.graph_chunk_count !== 1 ? 's' : ''} + ${vCount} vector chunk${vCount !== 1 ? 's' : ''}`
+      }
+      return `${event.chunk_count ?? 0} chunks retrieved (hybrid)`
     case 'grade':
       if (event.facets?.length >= 2) {
         const ok = event.facets.filter(f => f.grade === 'sufficient').length

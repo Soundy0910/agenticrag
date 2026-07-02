@@ -139,11 +139,16 @@ def _indexed_collections() -> set[str]:
         return set(COLLECTION_REGISTRY.keys())
 
 
-def _classify_collections(query: str) -> list[str]:
-    """Return the collection(s) most relevant to this query, best match first."""
+def _classify_collections(query: str, allowed: set[str] | None = None) -> list[str]:
+    """Return the collection(s) most relevant to this query, best match first.
+
+    allowed: optional set of collection names to restrict the search space (for RBAC).
+    """
     from backend.config import COLLECTION_REGISTRY
     registry = COLLECTION_REGISTRY
     indexed = _indexed_collections()
+    if allowed is not None:
+        indexed = indexed & allowed
     if not registry:
         return ["sec-filings"]
 
@@ -778,7 +783,14 @@ def router_node(state: AgentState) -> dict[str, Any]:
     collection: str = state["collection"]
 
     if collection == "auto":
-        active = _classify_collections(query)
+        role = state.get("user_role", "general")
+        allowed_set = {c for c, roles in cfg.COLLECTION_ROLES.items() if role in roles}
+        # Pass role's allowed collections as a filter so the classifier never picks a
+        # namespace the user can't access. Admin is unrestricted (sees all collections).
+        classify_allowed = allowed_set if allowed_set and role != "admin" else None
+        active = _classify_collections(query, allowed=classify_allowed) or (
+            sorted(allowed_set)[:1] if allowed_set else ["sec-filings"]
+        )
         collection = active[0]
     else:
         active = [collection]
@@ -810,10 +822,34 @@ def router_node(state: AgentState) -> dict[str, Any]:
     except Exception as exc:
         logger.warning("router: CAG check failed (%s)", exc)
 
-    # Graph check
+    # Graph check — trigger for structural/relational queries only.
+    # Broad content questions ("summarize risk factors") stay on vector;
+    # topology/relationship questions go to graph.
+    import re as _re
     finance_collections = {"sec_filings", "sec-filings", "finance", "filings"}
     neo4j_configured = bool(cfg.NEO4J_URI)
-    if collection in finance_collections and _is_comparison(query) and neo4j_configured:
+    q_lower_router = query.lower()
+
+    _GRAPH_TOPOLOGY_RE = _re.compile(
+        r'\bwhich\s+companies?\b'       # which companies have X
+        r'|\bwhat\s+companies?\b'       # what companies ...
+        r'|\bwhich\s+topics?\b'        # which topics are ...
+        r'|\bwhat\s+topics?\b'         # what topics ...
+        r'|\bconnected\s+to\b'         # connected to
+        r'|\blinked\s+to\b'            # linked to
+        r'|\bhow\s+are\b'              # how are X connected
+        r'|\bgraph\s+path\b'           # graph path explanation
+        r'|\brelationship\s+between\b' # relationship between
+        r'|\btopic.*connected\b'       # topic connected to
+        r'|\bsegment.*breakdown\b'     # segment breakdown
+        r'|\bshow.*segment\b'          # show segments
+        r'|\blist.*segment\b'          # list segments
+    )
+    is_graph_query = (
+        _is_comparison(query)
+        or bool(_GRAPH_TOPOLOGY_RE.search(q_lower_router))
+    )
+    if collection in finance_collections and is_graph_query and neo4j_configured:
         logger.info("router: graph")
         return {
             "route": "graph",
@@ -1126,26 +1162,67 @@ def retrieve_cag_node(state: AgentState) -> dict[str, Any]:
 # ════════════════════════════════════════════════════════════════════════════
 
 def retrieve_graph_node(state: AgentState) -> dict[str, Any]:
-    """Retrieve from Neo4j for relational/comparative questions."""
+    """
+    Hybrid retrieval: graph + vector in parallel, merged.
+
+    Graph contributes exact structured facts (metrics, risk factors, relationships).
+    Vector contributes supporting narrative evidence and source-grounded citations.
+    Graph results go first so the LLM sees precise facts before narrative context.
+    """
+    import concurrent.futures
     t0 = time.time()
     from backend.graph_rag.query import graph_query
     from backend.graph_rag.schema import get_schema
 
     query: str = state.get("rewritten_query") or state["question"]
     collection: str = state["collection"]
+    scopes: list[str] = state.get("allowed_scopes", ["public"])
     schema = get_schema(collection)
-    results = graph_query(query, schema, collection)
 
-    if results:
-        return {
-            "retrieved_chunks": results,
-            "reusable_chunks": results,
-            "step_latencies": {"retrieve_graph": round((time.time() - t0) * 1000)},
-        }
-    logger.warning("retrieve_graph_node: no results, falling back to vector")
-    result = retrieve_vector_node(state)
-    result["step_latencies"] = {"retrieve_graph": round((time.time() - t0) * 1000)}
-    return result
+    from backend.graph_rag.query import GraphQueryResult
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        graph_future = pool.submit(graph_query, query, schema, collection)
+        vector_future = pool.submit(_retrieve_for_facet, query, collection, scopes, 6)
+        try:
+            graph_result: GraphQueryResult = graph_future.result()
+            graph_chunks = graph_result.chunks if graph_result else []
+        except Exception as exc:
+            logger.warning("retrieve_graph_node: graph query failed: %s", exc)
+            graph_result = None
+            graph_chunks = []
+        try:
+            vector_results = vector_future.result() or []
+        except Exception as exc:
+            logger.warning("retrieve_graph_node: vector query failed: %s", exc)
+            vector_results = []
+
+    # Merge: graph facts first (precise structure), then vector evidence (source grounding)
+    seen: set[str] = set()
+    merged: list[ChunkResult] = []
+    for c in graph_chunks + vector_results:
+        if c.chunk_id not in seen:
+            seen.add(c.chunk_id)
+            merged.append(c)
+
+    query_type = graph_result.query_type if graph_result else "lookup"
+    unsupported_count = graph_result.unsupported_count if graph_result else 0
+
+    logger.info(
+        "retrieve_graph_node: type=%s graph=%d vector=%d merged=%d unsupported=%d",
+        query_type, len(graph_chunks), len(vector_results), len(merged), unsupported_count,
+    )
+
+    if not merged:
+        logger.warning("retrieve_graph_node: both graph and vector returned nothing")
+
+    return {
+        "retrieved_chunks": merged,
+        "reusable_chunks": merged,
+        "graph_chunk_count": len(graph_chunks),
+        "graph_query_type": query_type,
+        "graph_unsupported_count": unsupported_count,
+        "step_latencies": {"retrieve_graph": round((time.time() - t0) * 1000)},
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1172,30 +1249,37 @@ def _detect_conflicts(chunks: list[ChunkResult], query: str) -> tuple[bool, str]
             return value * 1000
         return value
 
-    # Collect (normalized_value, year) per chunk
-    chunk_values: list[tuple[float, str]] = []
+    def _company_key(c: "ChunkResult") -> str:
+        fn = c.filename.lower()
+        for key in _COMPANY_MARKERS:
+            if key in fn or key in c.doc_id.lower():
+                return key
+        return c.doc_id or c.filename
+
+    chunk_values: list[tuple[float, str, str]] = []
     for c in chunks[:6]:
         amounts = amount_pattern.findall(c.source_text)
         years = year_pattern.findall(c.source_text)
         year = years[0] if years else "unknown"
+        company = _company_key(c)
         for val_str, unit in amounts:
             try:
                 val = normalize(float(val_str.replace(",", "")), unit)
                 if val > 1000:  # only flag values that look like revenue-scale numbers
-                    chunk_values.append((val, year))
+                    chunk_values.append((val, year, company))
             except ValueError:
                 pass
 
     if len(chunk_values) < 2:
         return False, ""
 
-    # Check if two chunks have the same year but different values (>20% difference)
+    # Only flag conflict when the same company has diverging values for the same year.
     from collections import defaultdict
-    by_year: dict[str, list[float]] = defaultdict(list)
-    for val, year in chunk_values:
-        by_year[year].append(val)
+    by_company_year: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for val, year, company in chunk_values:
+        by_company_year[(company, year)].append(val)
 
-    for year, vals in by_year.items():
+    for (company, year), vals in by_company_year.items():
         if year == "unknown":
             continue
         unique_vals = list(set(round(v, -2) for v in vals))  # round to nearest 100M
@@ -1203,7 +1287,7 @@ def _detect_conflicts(chunks: list[ChunkResult], query: str) -> tuple[bool, str]
             min_v, max_v = min(unique_vals), max(unique_vals)
             if max_v > 0 and (max_v - min_v) / max_v > 0.15:  # >15% difference
                 return True, (
-                    f"Multiple different values found for {year}: "
+                    f"Multiple different values found for {company} in {year}: "
                     f"${min_v:,.0f}M and ${max_v:,.0f}M. "
                     f"These may refer to different periods, segments, or amended filings."
                 )
@@ -1458,7 +1542,8 @@ _QT_SYSTEM_PROMPTS: dict[str, str] = {
     "factual_lookup": (
         "You are a precise financial and legal document analyst. "
         "Answer the question DIRECTLY with a single clear answer including: "
-        "the exact value, its unit, the fiscal period, and the source. "
+        "the company or entity name, the metric or topic being reported, the exact value, its unit, "
+        "the fiscal period, and the source. "
         "Be concise. Cite the specific document section."
     ),
     "comparison": (
@@ -1647,9 +1732,45 @@ def generate_node(state: AgentState) -> dict[str, Any]:
             )
         user_content = f"{context}\n\nOriginal question: {query}\n\nProvide a structured answer addressing every part."
 
+    elif route == "graph":
+        # Split graph facts from vector evidence so citations only reference source passages
+        graph_chunks = [c for c in context_chunks if c.chunk_id.startswith("graph:")]
+        vector_chunks = [c for c in context_chunks if not c.chunk_id.startswith("graph:")]
+        graph_ctx = _chunks_to_context(graph_chunks) if graph_chunks else "(no graph facts retrieved)"
+        vector_ctx = _chunks_to_context(vector_chunks) if vector_chunks else "(no source passages retrieved)"
+        context = (
+            f"GRAPH_FACTS (from Neo4j knowledge graph — use for structure and relationships):\n{graph_ctx}"
+            f"\n\nSOURCE_EVIDENCE (verbatim document passages — cite only from this section):\n{vector_ctx}"
+        ) + numeric_context_block
+        system_prompt = (
+            "You are a precise financial analyst answering questions using a hybrid knowledge graph + document retrieval system. "
+            "Two context sections are provided:\n"
+            "1. GRAPH_FACTS — structured relational data from Neo4j (metrics, segments, risk topics, entity paths). Use this for relationship structure, entity connections, and precise numeric facts.\n"
+            "2. SOURCE_EVIDENCE — verbatim passages from source documents. Cite ONLY from SOURCE_EVIDENCE.\n\n"
+            "Rules:\n"
+            "- GRAPH_FACTS may contain [UNSUPPORTED — no source chunk] markers; treat those facts as unverified and do not cite them.\n"
+            "- Always ground your answer in SOURCE_EVIDENCE. If SOURCE_EVIDENCE contradicts GRAPH_FACTS, surface both values.\n"
+            "- Never fabricate. If context is insufficient, say so."
+            + _EXTRACTIVE_RULES
+        )
+        if conflict_detected:
+            system_prompt += (
+                f"\n\nWARNING — CONFLICTING VALUES DETECTED: {conflict_reason} "
+                f"Present both values and note the discrepancy."
+            )
+        user_content = f"{context}\n\nQuestion: {query}"
+        # Citations come from vector (source-grounded) chunks only — not raw graph facts
+        context_chunks = vector_chunks if vector_chunks else context_chunks
+
     else:
         context = _chunks_to_context(context_chunks, group_by_doc=(route == "cag")) + numeric_context_block
-        base_prompt = _QT_SYSTEM_PROMPTS.get(query_type, _QT_SYSTEM_PROMPTS["factual_lookup"])
+        # Legal-docs with multiple chunks → synthesize ALL clauses, not just the top one
+        effective_query_type = (
+            "multi_document_reasoning"
+            if collection == "legal-docs" and len(context_chunks) > 1
+            else query_type
+        )
+        base_prompt = _QT_SYSTEM_PROMPTS.get(effective_query_type, _QT_SYSTEM_PROMPTS["factual_lookup"])
         if route == "cag":
             system_prompt = (
                 "You are a precise, helpful assistant with access to a document collection. "
