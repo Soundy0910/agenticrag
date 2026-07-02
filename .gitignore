@@ -22,6 +22,8 @@ env/
 data/
 outputs/
 *.log
+VALIDATION_REPORT.md
+VALIDATION_RESULTS.json
 
 # macOS
 .DS_Store
