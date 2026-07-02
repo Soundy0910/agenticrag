@@ -24,6 +24,8 @@ outputs/
 *.log
 VALIDATION_REPORT.md
 VALIDATION_RESULTS.json
+ARCHITECTURE.md
+BUILD_PLAN.md
 
 # macOS
 .DS_Store
